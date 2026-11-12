@@ -50,6 +50,82 @@ def _create_helix_points(
     ]
 
 
+def create_scene(*, centers=None, color=None):
+    """Build the original two-cable scene; optional overrides affect placement and color only."""
+    num_segments = 60
+    cable_radius = 0.025
+    helix_radius = 0.22
+    helix_axis_length = 2.6
+    helix_turns = 2.5
+    stretch_stiffness = 1.0e6
+    bend_stiffness = 5.0e2
+    bend_damping = 1.0e0
+
+    builder = newton.ModelBuilder()
+    cable_cfg = builder.default_shape_cfg.copy()
+    cable_cfg.density = 800.0
+    cable_cfg.ke = 5.0e4
+    cable_cfg.kd = 0.0
+    cable_cfg.mu = 0.1
+
+    cable_height = cable_radius + helix_radius
+    left_center = wp.vec3(0.0, -0.75, cable_height) if centers is None else centers[0]
+    right_center = wp.vec3(0.0, 0.75, cable_height) if centers is None else centers[1]
+
+    left_initial_points = _create_helix_points(
+        left_center,
+        num_segments=num_segments,
+        axis_length=helix_axis_length,
+        radius=helix_radius,
+        turns=helix_turns,
+    )
+    # Keep the helical initial geometry but author zero intrinsic bend and twist.
+    left_rod = newton.Rod(left_initial_points, radius=cable_radius, rest_straight=True)
+    left_bodies, _ = builder.add_rod(
+        rod=left_rod,
+        cfg=cable_cfg,
+        stretch_stiffness=stretch_stiffness,
+        bend_stiffness=bend_stiffness,
+        bend_damping=bend_damping,
+        label="straight_rest_helix_initial",
+        color=(0.95, 0.35, 0.12) if color is None else color,
+    )
+
+    right_rest_points = _create_helix_points(
+        right_center,
+        num_segments=num_segments,
+        axis_length=helix_axis_length,
+        radius=helix_radius,
+        turns=helix_turns,
+    )
+    right_rest = newton.Rod(right_rest_points)
+    segment_length = float(wp.length(right_rest_points[1] - right_rest_points[0]))
+    right_rod = newton.Rod.create_straight(
+        start=wp.vec3(right_center[0] - 0.5 * num_segments * segment_length, right_center[1], right_center[2]),
+        direction=wp.vec3(1.0, 0.0, 0.0),
+        length=num_segments * segment_length,
+        segment_count=num_segments,
+        radius=cable_radius,
+        rest_points=right_rest.points,
+        rest_quaternions=right_rest.quaternions,
+    )
+    # Keep the straight initial geometry but author an explicit helical rest shape.
+    right_bodies, _ = builder.add_rod(
+        rod=right_rod,
+        cfg=cable_cfg,
+        stretch_stiffness=stretch_stiffness,
+        bend_stiffness=bend_stiffness,
+        bend_damping=bend_damping,
+        label="helix_rest_straight_initial",
+        color=(0.15, 0.65, 1.0) if color is None else color,
+    )
+    cable_bodies = [left_bodies, right_bodies]
+
+    builder.add_ground_plane()
+    builder.color(balance_colors=False)
+    return builder, cable_bodies
+
+
 class Example:
     def __init__(self, viewer, args):
         self.viewer = viewer
@@ -57,90 +133,30 @@ class Example:
 
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
-        self.sim_substeps = 5
-        self.sim_iterations = 5
+        self.sim_substeps = int(getattr(args, "substeps", 5))
+        self.sim_iterations = int(getattr(args, "iterations", 5))
+        if min(self.sim_substeps, self.sim_iterations, int(getattr(args, "linear_iterations", 10))) < 1:
+            raise ValueError("Substeps and iteration counts must be positive.")
         self.sim_dt = self.frame_dt / self.sim_substeps
         self.sim_time = 0.0
 
-        num_segments = 60
-        cable_radius = 0.025
-        helix_radius = 0.22
-        helix_axis_length = 2.6
-        helix_turns = 2.5
-        stretch_stiffness = 1.0e6
-        bend_stiffness = 5.0e2
-        bend_damping = 1.0e0
-
-        builder = newton.ModelBuilder()
-        cable_cfg = builder.default_shape_cfg.copy()
-        cable_cfg.density = 800.0
-        cable_cfg.ke = 5.0e4
-        cable_cfg.kd = 0.0
-        cable_cfg.mu = 0.1
-
-        cable_height = cable_radius + helix_radius
-        left_center = wp.vec3(0.0, -0.75, cable_height)
-        right_center = wp.vec3(0.0, 0.75, cable_height)
-
-        left_initial_points = _create_helix_points(
-            left_center,
-            num_segments=num_segments,
-            axis_length=helix_axis_length,
-            radius=helix_radius,
-            turns=helix_turns,
-        )
-        # Keep the helical initial geometry but author zero intrinsic bend and twist.
-        left_rod = newton.Rod(left_initial_points, radius=cable_radius, rest_straight=True)
-        left_bodies, _ = builder.add_rod(
-            rod=left_rod,
-            cfg=cable_cfg,
-            stretch_stiffness=stretch_stiffness,
-            bend_stiffness=bend_stiffness,
-            bend_damping=bend_damping,
-            label="straight_rest_helix_initial",
-            color=(0.95, 0.35, 0.12),
-        )
-
-        right_rest_points = _create_helix_points(
-            right_center,
-            num_segments=num_segments,
-            axis_length=helix_axis_length,
-            radius=helix_radius,
-            turns=helix_turns,
-        )
-        right_rest = newton.Rod(right_rest_points)
-        segment_length = float(wp.length(right_rest_points[1] - right_rest_points[0]))
-        right_rod = newton.Rod.create_straight(
-            start=wp.vec3(-0.5 * num_segments * segment_length, right_center[1], right_center[2]),
-            direction=wp.vec3(1.0, 0.0, 0.0),
-            length=num_segments * segment_length,
-            segment_count=num_segments,
-            radius=cable_radius,
-            rest_points=right_rest.points,
-            rest_quaternions=right_rest.quaternions,
-        )
-        # Keep the straight initial geometry but author an explicit helical rest shape.
-        right_bodies, _ = builder.add_rod(
-            rod=right_rod,
-            cfg=cable_cfg,
-            stretch_stiffness=stretch_stiffness,
-            bend_stiffness=bend_stiffness,
-            bend_damping=bend_damping,
-            label="helix_rest_straight_initial",
-            color=(0.15, 0.65, 1.0),
-        )
-        self.cable_bodies = [left_bodies, right_bodies]
-
-        builder.add_ground_plane()
-        builder.color(balance_colors=False)
+        builder, self.cable_bodies = create_scene()
         self.model = builder.finalize(device=args.device)
 
         self.collision_pipeline = newton.CollisionPipeline(self.model, contact_matching="latest")
         self.contacts = self.collision_pipeline.contacts()
-        self.solver = newton.solvers.SolverVBD(
-            self.model,
-            iterations=self.sim_iterations,
-        )
+        if getattr(args, "solver", "vbd") == "style3d":
+            self.solver = newton.solvers.SolverStyle3D(
+                self.model,
+                config=newton.solvers.SolverStyle3D.Config(
+                    enable_cable_viper=True,
+                    iterations=self.sim_iterations,
+                    linear_iterations=int(getattr(args, "linear_iterations", 10)),
+                    cable_viper_fixed_scale=getattr(args, "viper_fixed_scale", False),
+                ),
+            )
+        else:
+            self.solver = newton.solvers.SolverVBD(self.model, iterations=self.sim_iterations)
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
         self.control = self.model.control()
@@ -210,6 +226,16 @@ class Example:
 
 
 if __name__ == "__main__":
-    viewer, args = newton.examples.init()
+    parser = newton.examples.create_parser()
+    parser.add_argument("--solver", choices=["vbd", "style3d"], default="vbd")
+    parser.add_argument("--substeps", type=int, default=5, help="Substeps per frame, shared by both solvers.")
+    parser.add_argument("--iterations", type=int, default=5, help="Nonlinear sweeps per substep.")
+    parser.add_argument("--linear-iterations", type=int, default=10, help="Style3D PCG iterations per nonlinear sweep.")
+    parser.add_argument(
+        "--viper-fixed-scale",
+        action="store_true",
+        help="Style3D Cosserat mode: fixed radius with elastic stretch and twist.",
+    )
+    viewer, args = newton.examples.init(parser)
     example = Example(viewer, args)
     newton.examples.run(example, args)

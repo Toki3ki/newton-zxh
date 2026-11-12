@@ -4,7 +4,7 @@
 import numpy as np
 import warp as wp
 
-from .linear_solver import NonZeroEntry
+from .linear_solver import NonZeroEntry, SparseMatrixELL
 
 ########################################################################################################################
 ###########################################    PD Matrix Builder Kernels    ############################################
@@ -179,6 +179,114 @@ class PDMatrixBuilder:
         if vertex >= 0:
             raise ValueError(f"PD matrix capacity {self.max_neighbors} exceeded at vertex {vertex}.")
 
+    def add_scalar_stencils(self, indices, coefficients, weights, *, active):
+        """Assemble weighted scalar outer products with pinned increments eliminated.
+
+        Each residual is a scalar linear combination of vec3 unknowns. This
+        includes director constraints whose rest rotation mixes frame columns.
+        """
+        # For E=weight/2*||sum_i coeff_i*u_i||^2 (u_i in R^3),
+        # H_ij=weight*coeff_i*coeff_j*I3. Store only the scalar factor in ELL.
+        # active eliminates pinned INCREMENTS; pinned values remain in the
+        # residual used by the caller to assemble -grad(E).
+        indices = np.asarray(indices, dtype=np.int32)
+        coefficients = np.asarray(coefficients, dtype=float)
+        weights = np.asarray(weights, dtype=float)
+        active = np.asarray(active, dtype=float)
+        if (
+            indices.ndim != 2
+            or coefficients.shape != indices.shape
+            or weights.shape != (len(indices),)
+            or active.shape != (self.num_verts,)
+            or np.any(indices < 0)
+            or np.any(indices >= self.num_verts)
+            or not np.isfinite(coefficients).all()
+            or not np.isfinite(weights).all()
+            or np.any(weights < 0)
+            or not np.isin(active, [0, 1]).all()
+        ):
+            raise ValueError("Invalid scalar constraint stencils or active mask.")
+        counts, neighbors = self.counts.numpy(), self.neighbors.numpy()
+        values, diagonal = self.values.numpy(), self.diags.numpy()
+        for ids, coeff, weight in zip(indices, coefficients, weights, strict=True):
+            for i, row in enumerate(ids):
+                for j, col in enumerate(ids):
+                    value = weight * coeff[i] * coeff[j] * active[row] * active[col]
+                    if value == 0:
+                        continue
+                    if row == col:
+                        diagonal[row] += value
+                    else:
+                        found = np.flatnonzero(neighbors[row, : counts[row]] == col)
+                        slot = int(found[0]) if len(found) else int(counts[row])
+                        if slot >= self.max_neighbors:
+                            raise ValueError("Scalar stencil exceeds ELL row capacity.")
+                        if not len(found):
+                            neighbors[row, slot] = col
+                            counts[row] += 1
+                        values[row, slot] += value
+        self.counts.assign(counts)
+        self.neighbors.assign(neighbors)
+        self.values.assign(values)
+        self.diags.assign(diagonal)
+
+    def build_rod_pattern(self, edges, *, device):
+        """Build float ELL topology and scatter slots for a rod position solve."""
+        edges = np.asarray(edges, dtype=np.int32)
+        if edges.ndim != 2 or edges.shape[1] != 2 or np.any(edges < 0) or np.any(edges >= self.num_verts):
+            raise ValueError("Expected valid rod endpoint indices.")
+        neighbors = [set() for _ in range(self.num_verts)]
+        for a, b in edges:
+            if a == b:
+                raise ValueError("Rod endpoints must be distinct.")
+            neighbors[a].add(int(b))
+            neighbors[b].add(int(a))
+        counts = np.array([len(row) for row in neighbors], dtype=np.int32)
+        width = max(1, int(counts.max(initial=0)))
+        columns = np.zeros((self.num_verts, width), dtype=np.int32)
+        lookup = []
+        for row, cols in enumerate(neighbors):
+            ordered = sorted(cols)
+            columns[row, : len(ordered)] = ordered
+            lookup.append({col: slot for slot, col in enumerate(ordered)})
+        slots = np.array([[lookup[a][int(b)], lookup[b][int(a)]] for a, b in edges], dtype=np.int32)
+        matrix = SparseMatrixELL()
+        matrix.num_nz = wp.array(counts, dtype=int, device=device)
+        matrix.nz_ell = wp.zeros((width, self.num_verts), dtype=NonZeroEntry, device=device)
+        wp.launch(
+            assemble_nz_ell_kernel,
+            dim=self.num_verts,
+            inputs=[
+                wp.array(columns, dtype=int, device=device),
+                wp.zeros(columns.shape, dtype=float, device=device),
+                matrix.num_nz,
+            ],
+            outputs=[matrix.nz_ell],
+            device=device,
+        )
+        return (
+            matrix,
+            wp.array(slots, dtype=int, device=device),
+            wp.zeros((width, self.num_verts), dtype=float, device=device),
+        )
+
+    @staticmethod
+    def assemble_rod_matrix(matrix, slots, edges, weights, active, diagonal, values):
+        """Assemble scalar edge Laplacians, eliminating pinned increments."""
+        values.zero_()
+        wp.launch(
+            assemble_rod_laplacian,
+            dim=edges.shape[0],
+            inputs=[edges, slots, weights, active, diagonal, values],
+            device=diagonal.device,
+        )
+        wp.launch(
+            update_rod_ell,
+            dim=matrix.num_nz.shape[0],
+            inputs=[matrix.num_nz, values, matrix.nz_ell],
+            device=diagonal.device,
+        )
+
     def add_stretch_constraints(
         self,
         tri_indices: list[list[int]],
@@ -336,3 +444,33 @@ class PDMatrixBuilder:
         self.neighbors.assign(neighbors)
         self.values.assign(values)
         self.diags.assign(diags)
+
+
+@wp.kernel
+def assemble_rod_laplacian(
+    edges: wp.array2d[int],
+    slots: wp.array2d[int],
+    weights: wp.array[float],
+    active: wp.array[float],
+    diagonal: wp.array[float],
+    values: wp.array2d[float],
+):
+    # E_edge=k/2*||c_b-c_a||^2-t.dot(c_b-c_a)+const.
+    # Its Hessian is k*[[1,-1],[-1,1]] x I3. The target t affects rhs only.
+    # The caller initializes diagonal with M/h^2 and later adds contact bounds.
+    e = wp.tid()
+    a, b = edges[e, 0], edges[e, 1]
+    w = weights[e]
+    wp.atomic_add(diagonal, a, w * active[a])
+    wp.atomic_add(diagonal, b, w * active[b])
+    wp.atomic_add(values, slots[e, 0], a, -w * active[a] * active[b])
+    wp.atomic_add(values, slots[e, 1], b, -w * active[a] * active[b])
+
+
+@wp.kernel
+def update_rod_ell(counts: wp.array[int], values: wp.array2d[float], entries: wp.array2d[NonZeroEntry]):
+    row = wp.tid()
+    for slot in range(counts[row]):
+        entry = entries[slot, row]
+        entry.value = values[slot, row]
+        entries[slot, row] = entry

@@ -15,6 +15,7 @@ from ...sim import Contacts, Control, Model, ModelBuilder, State
 from ..coupled.interface import CouplingInterface
 from ..solver import SolverBase
 from .builder import PDMatrixBuilder, _compute_max_neighbors
+from .cable_viper import CableViper
 from .collision import Collision
 from .collision.kernels import scatter_proxy_body_wrenches_kernel
 from .damping import MaterialDamping, add_diagonal_kernel, add_vectors_kernel
@@ -180,6 +181,42 @@ class SolverStyle3D(SolverBase, CouplingInterface):
         tet_sipd_relaxation: float = 1.0
         """Under-relax each nonlinear SIPD position update."""
 
+        enable_cable_viper: bool = False
+        """Experimental Warp VIPER rod-only path with frictionless fixed-radius contact."""
+
+        # Cable energy/assembly map:
+        # cable_viper.py: generalized variables, W mapping, alternating solve.
+        # cable_viper_kernels.py: E=0.5*sum ||sqrt(W)*C||^2, inertia and contact.
+        # cable_directors.py: optional chord energy on R's three columns.
+        # builder.py: position Laplacian and director scalar outer products.
+
+        cable_viper_volume_ratio: float = 10.0
+        """Volume penalty relative to authored rod stiffness."""
+
+        cable_viper_radial_ratio: float = 0.1
+        """Radial stiffness relative to authored axial stiffness."""
+
+        cable_viper_relaxation: float = 0.5
+        """Initial trial step size for cable material and position updates."""
+
+        cable_viper_fixed_scale: bool = False
+        """Cosserat mode: remove scale unknowns and VIPER volume/radial energies.
+
+        Reference scale is one. Stretch, shear, bend and twist remain elastic.
+        No hard length projection. Global rotation mode projects directors to
+        SO(3) when proposing frames. Rebuild to change this option.
+        """
+
+        cable_viper_rotation_solver: str = "local"
+        """Experimental rotation update: local log strain or global director chord strain.
+
+        The global option requires fixed scale and twist stiffness <= twice bend stiffness.
+        Rebuild the solver to switch modes.
+        """
+
+        cable_viper_rotation_proximal: float = 1.0
+        """Positive numerical proximal weight multiplier for global director updates."""
+
     config: Config
     """Live solver options, retained by reference when supplied at construction.
 
@@ -328,6 +365,11 @@ class SolverStyle3D(SolverBase, CouplingInterface):
             )
 
         super().__init__(model)
+        self._cable_viper = None
+        if config.enable_cable_viper:
+            self.config = config
+            self._cable_viper = CableViper(model, config)
+            return
         if not hasattr(model, "style3d"):
             raise AttributeError(
                 "Style3D custom attributes are missing from the model. "
@@ -432,6 +474,9 @@ class SolverStyle3D(SolverBase, CouplingInterface):
 
         if self.config.iterations < 1:
             raise ValueError(f"Config.iterations must be at least 1, got {self.config.iterations}.")
+        if self._cable_viper is not None:
+            self._cable_viper.step(state_in, state_out, dt, contacts)
+            return
         if (
             self.config.tet_solver != self._matrix_tet_solver
             or self.config.tet_pd_volume_ratio != self._matrix_volume_ratio
