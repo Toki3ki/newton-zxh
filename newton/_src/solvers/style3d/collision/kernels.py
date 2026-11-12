@@ -67,9 +67,10 @@ def eval_body_contact_kernel(
     contact_body_vel: wp.array[wp.vec3],
     contact_normal: wp.array[wp.vec3],
     shape_margin: wp.array[float],
-    # outputs: particle force and hessian
+    # outputs: particle force/hessian and equal-and-opposite body wrench
     forces: wp.array[wp.vec3],
     hessians: wp.array[wp.mat33],
+    body_wrenches: wp.array[wp.spatial_vector],
 ):
     t_id = wp.tid()
 
@@ -102,6 +103,29 @@ def eval_body_contact_kernel(
         )
         wp.atomic_add(forces, particle_idx, body_contact_force)
         wp.atomic_add(hessians, particle_idx, body_contact_hessian)
+
+        shape_index = contact_shape[t_id]
+        body_index = shape_body[shape_index]
+        if body_index >= 0:
+            X_wb = body_q[body_index]
+            contact_point = wp.transform_point(X_wb, contact_body_pos[t_id])
+            com_world = wp.transform_point(X_wb, body_com[body_index])
+            reaction = -body_contact_force
+            torque = wp.cross(contact_point - com_world, reaction)
+            wp.atomic_add(body_wrenches, body_index, wp.spatial_vector(reaction, torque))
+
+
+@wp.kernel
+def scatter_proxy_body_wrenches_kernel(
+    body_local_to_proxy_global: wp.array[int],
+    body_wrenches: wp.array[wp.spatial_vector],
+    # outputs
+    proxy_wrenches: wp.array[wp.spatial_vector],
+):
+    body_index = wp.tid()
+    proxy_global = body_local_to_proxy_global[body_index]
+    if proxy_global >= 0:
+        wp.atomic_add(proxy_wrenches, proxy_global, body_wrenches[body_index])
 
 
 @wp.kernel

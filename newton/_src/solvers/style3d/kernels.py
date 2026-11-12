@@ -185,6 +185,8 @@ def eval_bend_kernel(
         wp.atomic_add(forces, edge[i], force)
 
 
+
+
 @wp.kernel
 def eval_drag_force_kernel(
     spring_stiff: float,
@@ -259,6 +261,139 @@ def cofactor_mat33(F: wp.mat33):
     C[2, 1] = F[0, 2] * F[1, 0] - F[0, 0] * F[1, 2]
     C[2, 2] = F[0, 0] * F[1, 1] - F[0, 1] * F[1, 0]
     return C
+
+
+@wp.func
+def _tet_pd_volume_stretches(s: wp.vec3d, z_start: wp.vec2d):
+    """Minimize distance in feasible log coordinates using an Armijo search.
+
+    q=(exp(u), exp(v), exp(-u-v)) has positive unit product throughout.
+    Double precision keeps the small local solve accurate near equilibrium;
+    all global simulation arrays remain float32.
+    """
+    z = z_start
+    q = wp.vec3d(wp.exp(z[0]), wp.exp(z[1]), wp.exp(-z[0] - z[1]))
+    energy = wp.dot(q - s, q - s) * wp.float64(0.5)
+    for _iteration in range(64):
+        # Gradient and Hessian of 1/2 ||q(z)-s||^2.
+        g = wp.vec2d(
+            q[0] * (q[0] - s[0]) - q[2] * (q[2] - s[2]),
+            q[1] * (q[1] - s[1]) - q[2] * (q[2] - s[2]),
+        )
+        if wp.length(g) <= wp.float64(1.0e-9) * (wp.float64(1.0) + wp.dot(q, q)):
+            break
+        h2 = q[2] * (wp.float64(2.0) * q[2] - s[2])
+        h0 = q[0] * (wp.float64(2.0) * q[0] - s[0]) + h2
+        h1 = q[1] * (wp.float64(2.0) * q[1] - s[1]) + h2
+        determinant = h0 * h1 - h2 * h2
+        # An indefinite Newton matrix is replaced by a descent direction;
+        # the line search accepts only actual objective decrease.
+        direction = -g / (
+            wp.abs(h0) + wp.abs(h1) + wp.float64(2.0) * wp.abs(h2) + wp.float64(1.0)
+        )
+        if h0 > wp.float64(0.0) and determinant > wp.float64(0.0):
+            direction = wp.vec2d(-h1 * g[0] + h2 * g[1], h2 * g[0] - h0 * g[1]) / determinant
+        slope = wp.dot(g, direction)
+        step = wp.float64(1.0)
+        accepted = bool(False)
+        for _backtrack in range(40):
+            trial_z = z + step * direction
+            trial_q = wp.vec3d(
+                wp.exp(trial_z[0]), wp.exp(trial_z[1]), wp.exp(-trial_z[0] - trial_z[1])
+            )
+            trial_energy = wp.dot(trial_q - s, trial_q - s) * wp.float64(0.5)
+            if wp.isfinite(trial_energy) and trial_energy <= energy + wp.float64(1.0e-4) * step * slope:
+                z = trial_z
+                q = trial_q
+                energy = trial_energy
+                accepted = True
+                break
+            step *= wp.float64(0.5)
+        if not accepted:
+            break
+    return q
+
+
+@wp.func
+def tet_pd_volume_target(F: wp.mat33):
+    """Find a feasible local closest-point target with det(Q)=1.
+
+    Warp's U and V are proper rotations; the last singular value carries the
+    sign of det(F). No singular-value floor or post-solve rescaling is used.
+    Several feasible starts address the nonconvex expanded/inverted cases.
+    The line search decreases the distance within each local solve, but does
+    not certify a global nearest point. A local/global caller must also retain
+    its previous feasible target if it has lower distance at the current F.
+    """
+    U, sigma, V = wp.svd3(F)
+    s = wp.vec3d(wp.float64(sigma[0]), wp.float64(sigma[1]), wp.float64(sigma[2]))
+    q = _tet_pd_volume_stretches(s, wp.vec2d(wp.float64(0.0)))
+    best = wp.dot(q - s, q - s)
+    # Preserve two positive stretches and repair only the third. These starts
+    # also escape the symmetric stationary point of large isotropic expansion.
+    for omitted in range(3):
+        a = (omitted + 1) % 3
+        b = (omitted + 2) % 3
+        if s[a] > wp.float64(0.0) and s[b] > wp.float64(0.0):
+            log_q = wp.vec3d(wp.float64(0.0))
+            log_q[a] = wp.log(s[a])
+            log_q[b] = wp.log(s[b])
+            log_q[omitted] = -log_q[a] - log_q[b]
+            candidate = _tet_pd_volume_stretches(s, wp.vec2d(log_q[0], log_q[1]))
+            distance = wp.dot(candidate - s, candidate - s)
+            if distance < best:
+                q = candidate
+                best = distance
+    diagonal = wp.mat33(0.0)
+    diagonal[0, 0] = wp.float32(q[0])
+    diagonal[1, 1] = wp.float32(q[1])
+    diagonal[2, 2] = wp.float32(q[2])
+    return U * diagonal * wp.transpose(V)
+
+
+@wp.kernel
+def eval_tet_pd_constraint_kernel(
+    pos: wp.array[wp.vec3],
+    tet_indices: wp.array2d[wp.int32],
+    tet_poses: wp.array[wp.mat33],
+    tet_materials: wp.array2d[float],
+    volume_ratio: float,
+    forces: wp.array[wp.vec3],
+):
+    """Evaluate a small-strain-matched PD surrogate for Stable Neo-Hookean.
+
+    The per-tet energy is
+
+        mu*V*||F-R||_F^2 + 3/2*lambda*V*volume_ratio*||F-Q||_F^2,
+
+    where R is the closest proper rotation and det(Q)=1. Its quadratic
+    expansion at F=I is ``V*(mu*||eps||^2 + lambda/2*tr(eps)^2)`` when
+    ``volume_ratio=1``. This matches Stable Neo-Hookean to second order,
+    while retaining a constant scalar PD global operator.
+    """
+    tid = wp.tid()
+    F = tet_deformation_gradient(pos, tet_indices, tet_poses, tid)
+    U, _sigma, V = wp.svd3(F)
+    correction = wp.identity(3, dtype=float)
+    if wp.determinant(U * wp.transpose(V)) < 0.0:
+        # Warp's singular values are sorted in descending order.
+        correction[2, 2] = -1.0
+    R = U * correction * wp.transpose(V)
+    inv_dm = tet_poses[tid]
+    volume = 1.0 / (6.0 * wp.determinant(inv_dm))
+    mu = tet_materials[tid, 0]
+    lam = tet_materials[tid, 1]
+    P = (2.0 * mu * volume) * (F - R)
+    if volume_ratio > 0.0:
+        Q = tet_pd_volume_target(F)
+        P += (3.0 * lam * volume_ratio * volume) * (F - Q)
+    for i in range(4):
+        b = wp.vec3(0.0)
+        if i == 0:
+            b = -(inv_dm[0] + inv_dm[1] + inv_dm[2])
+        else:
+            b = inv_dm[i - 1]
+        wp.atomic_add(forces, tet_indices[tid, i], -(P * b))
 
 
 @wp.func
@@ -457,7 +592,6 @@ def eval_tet_sipd_force_kernel(
     # det(Dm) = 6 * rest_volume
     inv_dm_det = wp.determinant(tet_poses[tid])
     rest_volume = 1.0 / (6.0 * inv_dm_det)
-
     P_e = rest_volume * P
 
     # 四面体的四个局部顶点
@@ -621,6 +755,7 @@ def sipd_semi_implicit_solve_kernel(
     source: wp.array[wp.vec3],
     A_diag: wp.array[wp.vec3],
     A_upper: wp.array[wp.vec3],
+    static_A_diag: wp.array[float],
     contact_hessian: wp.array[wp.mat33],
     particle_masses: wp.array[float],
     particle_flags: wp.array[wp.int32],
@@ -647,7 +782,7 @@ def sipd_semi_implicit_solve_kernel(
         wp.vec3(u[0], d[1], u[2]),
         wp.vec3(u[1], u[2], d[2]),
     )
-    A += contact_hessian[tid]
+    A += wp.identity(3, dtype=wp.float32) * static_A_diag[tid] + contact_hessian[tid]
 
     dt2_over_mass = dt * dt / particle_masses[tid]
     hess = wp.identity(3, dtype=wp.float32) + dt2_over_mass * A

@@ -1,18 +1,22 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Compare VBD and SIPD-Semi on the softbody_hanging tetrahedral beam.
+"""Compare VBD, SIPD-Semi and scalar PD on the softbody_hanging beam.
 
-Blue bodies use VBD; orange bodies use SIPD-Semi. Within each solver, increasing
+Blue bodies use VBD, orange SIPD-Semi, and green scalar PD. Within each solver, increasing
 iteration counts use darker shades. Render-only offsets arrange identical
-physics models in two columns. Use --overlay to compare their shapes directly.
+physics models in three columns. Use --overlay to compare their shapes directly.
 
-Both paths use identical geometry, Lamé parameters, mass, initial conditions,
+Scalar PD uses rotation and unit-volume projections whose quadratic expansion
+matches Stable Neo-Hookean at rest. It still differs at finite strain.
+PCG uses 10 inner iterations per outer step.
+
+All three paths use identical geometry, Lamé parameters, mass, initial conditions,
 gravity, timestep and substeps. Material damping is off by default; --damping
-enables the same objective metric damping in both solvers, using --damping-value.
+enables the same objective metric damping in all three solvers, using --damping-value.
 There are no contacts or picking forces, to isolate the material solve.
 The surface triangles are only for display; there are no cloth constraints.
-Both solvers use eager execution and reconstruct velocity without attenuation.
+All three solvers use eager execution and reconstruct velocity without attenuation.
 SIPD uses full local updates by default; --sipd-relaxation changes that experiment.
 
 The native lower-right Plots panel shows colored live tip sag, maximum speed,
@@ -26,7 +30,7 @@ and rendering, and is not a CUDA-graph performance benchmark.
 with several iteration budgets, rather than comparing different trajectories.
 
 Success criteria:
-- Two columns of colored hanging beams remain finite and attached at the left.
+- Three columns of colored hanging beams remain finite and attached at the left.
 - Matching iteration budgets have the same physical inputs.
 - The panel identifies each solver, iteration budget and latest diagnostics.
 - Native live plots use the same colors as the bodies and show data from t=0.
@@ -50,6 +54,82 @@ import warp as wp
 import newton
 import newton.examples
 
+_SOLVER_SPECS = (
+    ("vbd", "VBD", (0.1, 0.35, 0.9)),
+    ("sipd", "SIPD-Semi", (0.95, 0.30, 0.04)),
+    ("pd", "Scalar PD", (0.12, 0.65, 0.25)),
+)
+_SOLVER_NAMES = {kind: name for kind, name, _ in _SOLVER_SPECS}
+
+
+def _pd_volume_targets(F):
+    """Evaluate the solver's multistart log-space volume projection in NumPy.
+
+    This float64 diagnostic mirrors the local solve's starts, stopping rule and
+    Armijo search. It returns feasible local targets, not certified global
+    minimizers. Energy and residual therefore share the local solve's accuracy.
+    """
+    U, s, Vh = np.linalg.svd(F)
+    sign = np.where(np.linalg.det(U @ Vh) < 0.0, -1.0, 1.0)
+    U[:, :, 2] *= sign[:, None]
+    s[:, 2] *= sign
+    starts = np.zeros((4, len(F), 3), dtype=np.float64)
+    for omitted in range(3):
+        a, b = (omitted + 1) % 3, (omitted + 2) % 3
+        valid = (s[:, a] > 0.0) & (s[:, b] > 0.0)
+        starts[omitted + 1, valid, a] = np.log(s[valid, a])
+        starts[omitted + 1, valid, b] = np.log(s[valid, b])
+        starts[omitted + 1, valid, omitted] = -starts[omitted + 1, valid].sum(axis=1)
+    z = starts[:, :, :2].reshape(-1, 2).copy()
+    s_all = np.tile(s, (4, 1))
+
+    def stretches(coordinates):
+        with np.errstate(over="ignore", under="ignore"):
+            return np.exp(np.column_stack((coordinates, -coordinates.sum(axis=1))))
+
+    q = stretches(z)
+    energy = 0.5 * np.sum((q - s_all) ** 2, axis=1)
+    active = np.ones(len(q), dtype=bool)
+    for _ in range(64):
+        terms = q * (q - s_all)
+        g = terms[:, :2] - terms[:, 2, None]
+        active &= np.linalg.norm(g, axis=1) > 1.0e-9 * (1.0 + np.sum(q * q, axis=1))
+        ids = np.flatnonzero(active)
+        if not len(ids):
+            break
+        h = q[ids] * (2.0 * q[ids] - s_all[ids])
+        h0, h1, h2 = h[:, 0] + h[:, 2], h[:, 1] + h[:, 2], h[:, 2]
+        determinant = h0 * h1 - h2 * h2
+        grad = g[ids]
+        direction = -grad / (np.abs(h0) + np.abs(h1) + 2.0 * np.abs(h2) + 1.0)[:, None]
+        positive = (h0 > 0.0) & (determinant > 0.0)
+        newton_direction = np.column_stack(
+            (-h1 * grad[:, 0] + h2 * grad[:, 1], h2 * grad[:, 0] - h0 * grad[:, 1])
+        )
+        direction[positive] = newton_direction[positive] / determinant[positive, None]
+        slope = np.sum(grad * direction, axis=1)
+        step = np.ones(len(ids))
+        pending = np.ones(len(ids), dtype=bool)
+        for _ in range(40):
+            rows = np.flatnonzero(pending)
+            if not len(rows):
+                break
+            trial_z = z[ids[rows]] + step[rows, None] * direction[rows]
+            trial_q = stretches(trial_z)
+            with np.errstate(over="ignore", invalid="ignore"):
+                trial_energy = 0.5 * np.sum((trial_q - s_all[ids[rows]]) ** 2, axis=1)
+            accepted = np.isfinite(trial_energy) & (
+                trial_energy <= energy[ids[rows]] + 1.0e-4 * step[rows] * slope[rows]
+            )
+            dest = ids[rows[accepted]]
+            z[dest], q[dest], energy[dest] = trial_z[accepted], trial_q[accepted], trial_energy[accepted]
+            pending[rows[accepted]] = False
+            step[rows[~accepted]] *= 0.5
+        active[ids[pending]] = False
+    best = np.argmin(energy.reshape(4, len(F)), axis=0)
+    q = q.reshape(4, len(F), 3)[best, np.arange(len(F))]
+    return (U * q[:, None, :]) @ Vh
+
 
 def _write_rows(path, rows, *, append=False):
     path = Path(path)
@@ -66,7 +146,7 @@ class _SolverLayer:
         self.solver_kind = solver_kind
         self.iterations = iterations
         self.color = color
-        self.layer_id = f"{'VBD' if solver_kind == 'vbd' else 'SIPD-Semi'} / {iterations} iterations"
+        self.layer_id = f"{_SOLVER_NAMES[solver_kind]} / {iterations} iterations"
         self.sim_substeps = sim_substeps
         self.sim_dt = sim_dt
         builder = newton.ModelBuilder()
@@ -104,7 +184,7 @@ class _SolverLayer:
                     iterations=iterations,
                     enable_surface_constraints=False,
                     enable_tet_sipd=True,
-                    tet_solver="semi_implicit",
+                    tet_solver="pd" if solver_kind == "pd" else "semi_implicit",
                     tet_sipd_relaxation=relaxation,
                 ),
             )
@@ -141,6 +221,21 @@ class _SolverLayer:
         psi = 0.5 * mu * (np.sum(F * F, axis=(1, 2)) - 3.0) - mu * (J - 1.0)
         psi += 0.5 * lam_nh * (J - 1.0) ** 2
         P = mu[:, None, None] * F + (lam_nh * (J - 1.0) - mu)[:, None, None] * cof
+        if self.solver_kind == "pd":
+            U, _, Vh = np.linalg.svd(F)
+            correction = np.ones((len(F), 3))
+            correction[:, 2] = np.where(np.linalg.det(U @ Vh) < 0.0, -1.0, 1.0)
+            R = (U * correction[:, None, :]) @ Vh
+            difference = F - R
+            psi = mu * np.sum(difference**2, axis=(1, 2))
+            P = (2.0 * mu)[:, None, None] * difference
+            volume_ratio = self.solver.config.tet_pd_volume_ratio
+            if volume_ratio > 0.0:
+                Q = _pd_volume_targets(F)
+                volume_difference = F - Q
+                volume_weight = 3.0 * self.materials[:, 1] * volume_ratio
+                psi += 0.5 * volume_weight * np.sum(volume_difference**2, axis=(1, 2))
+                P += volume_weight[:, None, None] * volume_difference
         h = self.volumes[:, None, None] * (P @ self.inv_dm.transpose(0, 2, 1))
         gradient = np.zeros_like(positions)
         np.add.at(gradient, self.tets[:, 0], -np.sum(h, axis=2))
@@ -167,7 +262,7 @@ class _SolverLayer:
             for vertex in range(1, 4):
                 np.add.at(gradient, self.tets[:, vertex], h_damp[:, :, vertex - 1])
         predicted = previous + self.sim_dt * previous_velocity + self.sim_dt**2 * self.gravity
-        # Stationarity of the SAME implicit-Euler objective on unfixed particles.
+        # Stationarity of each solver's own implicit-Euler material objective.
         residual = (self.mass[:, None] / self.sim_dt**2) * (positions - predicted) + gradient
         free_residual = residual[self.free]
         kinetic = 0.5 * np.sum(self.mass[:, None] * velocities**2)
@@ -285,7 +380,7 @@ class Example:
         budgets = sorted(set(args.iterations))
         self.layers = []
         self.viewer.picking_enabled = False
-        for column, (kind, base) in enumerate((("vbd", (0.1, 0.35, 0.9)), ("sipd", (0.95, 0.30, 0.04)))):
+        for column, (kind, _, base) in enumerate(_SOLVER_SPECS):
             for row, budget in enumerate(budgets):
                 fraction = row / max(1, len(budgets) - 1)
                 # Mix with white: fewer iterations are lighter, more are darker.
@@ -296,7 +391,7 @@ class Example:
                 self.layers.append(layer)
                 viewer.activate(layer.layer_id)
                 viewer.set_model(layer.model)
-                offset = wp.vec3(0.0) if args.overlay else wp.vec3(column * 1.8 - 0.9, row * 0.8, 0.0)
+                offset = wp.vec3(0.0) if args.overlay else wp.vec3((column - 1) * 1.8, row * 0.8, 0.0)
                 viewer.set_layer_transform(layer.layer_id, wp.transform(offset, wp.quat_identity()))
                 self.plot_values[layer.layer_id] = {
                     key: deque(maxlen=600) for key in ("tip_sag_m", "max_speed_m_s", "residual_rms_N")
@@ -315,7 +410,7 @@ class Example:
         # of the evolving states and solver work buffers displayed above.
         self.convergence_rows = []
         sweep = sorted({1, 2, 4, 8, 16, 32, 64, *budgets})
-        for kind, base in (("vbd", (0.1, 0.35, 0.9)), ("sipd", (0.95, 0.30, 0.04))):
+        for kind, _, base in _SOLVER_SPECS:
             diagnostic_layer = _SolverLayer(
                 kind, budgets[-1], base, self.sim_substeps, self.sim_dt, args.sipd_relaxation, self.damping_value
             )
@@ -325,9 +420,8 @@ class Example:
             print(f"Same-state convergence sweep: {Path(args.convergence_csv).resolve()}")
         if hasattr(viewer, "register_ui_callback"):
             viewer.register_ui_callback(self._plot_panel, position="free")
-        print(
-            f"VBD (blue), SIPD-Semi (orange); iterations={budgets}, dt={self.sim_dt:.8f}, relaxation={args.sipd_relaxation}"
-        )
+        print(f"VBD (blue), SIPD-Semi (orange), Scalar PD (green); iterations={budgets}, dt={self.sim_dt:.8f}")
+        print("Scalar PD: SNH small-strain-matched shape + volume projections; PCG inner iterations=10.")
         print(f"Material damping={self.damping_value:g} Pa s, no contacts/picking; darker = more iterations.")
 
     def step(self):
@@ -365,9 +459,10 @@ class Example:
 
     def gui(self, ui):
         ui.text(f"Simulation time: {self.sim_time:.3f} s | dt: {self.sim_dt:.6f} s")
-        ui.text("Blue: VBD | Orange: SIPD-Semi")
+        ui.text("Blue: VBD | Orange: SIPD-Semi | Green: Scalar PD")
+        ui.text("PD: SNH small-strain match, shape + volume; inner PCG=10")
         ui.text("Light to dark: increasing iterations")
-        ui.text(f"Material damping: {self.damping_value:g} Pa s | no extra velocity attenuation")
+        ui.text(f"Material damping (all three): {self.damping_value:g} Pa s | no extra velocity attenuation")
         ui.text("No contacts or picking; launch with --damping or --no-damping")
         ui.text("Residual: implicit-Euler force balance, last substep")
         ui.text("Live colored curves: Plots - Hanging Comparison (lower right)")
@@ -423,7 +518,8 @@ class Example:
             if implot.get_current_context() is None:
                 implot.create_context()
                 self._owns_implot_context = True
-            ui.text(f"Live time: {self.sim_time:.3f} s | blue: VBD | orange: SIPD-Semi")
+            ui.text(f"Time: {self.sim_time:.3f}s | Blue VBD / Orange SIPD / Green PD")
+            ui.text("PD uses its own material energy and residual.")
             _, self.plot_mode = ui.combo(
                 "Plot",
                 self.plot_mode,
@@ -436,11 +532,10 @@ class Example:
             )
             if self.plot_mode == 0:
                 ui.text("Independent fixed bent state; x-axis is iteration budget.")
-                ui.text("Both solvers start from the same state and solve one dt.")
+                ui.text("All three solvers start from the same state and solve one dt.")
                 traces = []
-                for kind, color in (("vbd", (0.1, 0.35, 0.9)), ("sipd", (0.95, 0.30, 0.04))):
+                for kind, label, color in _SOLVER_SPECS:
                     rows = [row for row in self.convergence_rows if row["solver"] == kind]
-                    label = "VBD" if kind == "vbd" else "SIPD-Semi"
                     traces.append(
                         (label, color, [row["iterations"] for row in rows], [row["residual_relative"] for row in rows])
                     )
@@ -456,12 +551,10 @@ class Example:
                 )
             else:
                 ui.text("Darker = more iterations. Toggle overlapping traces.")
-                count = len(self.layers) // 2
+                count = len(self.layers) // 3
                 for index in range(count):
-                    for column in range(2):
+                    for column in range(3):
                         layer = self.layers[column * count + index]
-                        if column:
-                            ui.same_line(width * 0.5)
                         ui.push_style_color(ui.Col_.text, ui.ImVec4(*layer.color, 1.0))
                         _, self.plot_visible[layer.layer_id] = ui.checkbox(
                             layer.layer_id, self.plot_visible[layer.layer_id]
@@ -506,13 +599,13 @@ class Example:
     @staticmethod
     def create_parser():
         parser = newton.examples.create_parser()
-        parser.add_argument("--iterations", nargs="+", type=int, default=[2, 8, 16])
+        parser.add_argument("--iterations", nargs="+", type=int, default=[8])
         parser.add_argument("--substeps", type=int, default=10)
         parser.add_argument(
             "--damping",
             action=argparse.BooleanOptionalAction,
             default=False,
-            help="Enable the same material damping for both solvers (default off)",
+            help="Enable the same material damping for all three solvers (default off)",
         )
         parser.add_argument(
             "--damping-value",

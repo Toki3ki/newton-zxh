@@ -46,6 +46,10 @@ class Collision:
 
         self.Hx = wp.zeros(model.particle_count, dtype=wp.vec3, device=self.model.device)
         self.contact_hessian_diags = wp.zeros(model.particle_count, dtype=wp.mat33, device=self.model.device)
+        # Last nonlinear iteration's equal-and-opposite particle/body contact
+        # wrench. Coupled solvers harvest this without asking Style3D to
+        # integrate proxy rigid bodies.
+        self.body_contact_wrenches = wp.zeros(model.body_count, dtype=wp.spatial_vector, device=self.model.device)
 
         self.edge_bvh.build(model.particle_q, self.model.edge_indices, self.radius)
         self.tri_bvh.build(model.particle_q, self.model.tri_indices, self.radius)
@@ -148,6 +152,7 @@ class Collision:
         contacts._assert_particle_only_soft_contacts("SolverStyle3D")
         thickness = 2.0 * self.radius
         self.contact_hessian_diags.zero_()
+        self.body_contact_wrenches.zero_()
 
         if self.stiff_vf > 0:
             wp.launch(
@@ -218,7 +223,7 @@ class Collision:
                 self.model.shape_body,
                 state_out.body_q if self.integrate_with_external_rigid_solver else state_in.body_q,
                 state_in.body_q if self.integrate_with_external_rigid_solver else None,
-                self.model.body_qd,
+                state_in.body_qd,
                 self.model.body_com,
                 contacts.soft_contact_shape,
                 contacts.soft_contact_body_pos,
@@ -226,7 +231,7 @@ class Collision:
                 contacts.soft_contact_normal,
                 self.model.shape_margin,
             ],
-            outputs=[particle_forces, self.contact_hessian_diags],
+            outputs=[particle_forces, self.contact_hessian_diags, self.body_contact_wrenches],
             device=self.model.device,
         )
 

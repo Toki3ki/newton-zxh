@@ -12,9 +12,12 @@ import warp as wp
 from ...core.types import override
 from ...exceptions import NewtonDeprecationWarning
 from ...sim import Contacts, Control, Model, ModelBuilder, State
+from ..coupled.interface import CouplingInterface
 from ..solver import SolverBase
 from .builder import PDMatrixBuilder, _compute_max_neighbors
 from .collision import Collision
+from .collision.kernels import scatter_proxy_body_wrenches_kernel
+from .damping import MaterialDamping, add_diagonal_kernel, add_vectors_kernel
 from .kernels import (
     accumulate_dragging_pd_diag_kernel,
     build_sipd_matrix_diags_kernel,
@@ -22,6 +25,7 @@ from .kernels import (
     eval_bend_kernel,
     eval_drag_force_kernel,
     eval_stretch_kernel,
+    eval_tet_pd_constraint_kernel,
     eval_tet_sipd_force_kernel,
     init_rhs_kernel,
     init_step_kernel,
@@ -29,8 +33,6 @@ from .kernels import (
     nonlinear_step_kernel,
     prepare_jacobi_preconditioner_kernel,
     prepare_jacobi_preconditioner_matrix_kernel,
-    prepare_jacobi_preconditioner_matrix_no_contact_kernel,
-    prepare_jacobi_preconditioner_no_contact_hessian_kernel,
     sipd_semi_implicit_solve_kernel,
     update_velocity,
 )
@@ -62,7 +64,7 @@ def _warn_legacy_attribute(name: str, config_name: str) -> None:
 ########################################################################################################################
 
 
-class SolverStyle3D(SolverBase):
+class SolverStyle3D(SolverBase, CouplingInterface):
     r"""Projective dynamics based cloth solver.
 
     References:
@@ -165,7 +167,15 @@ class SolverStyle3D(SolverBase):
         """Use SIPD pairwise forces for tetrahedral elements when present."""
 
         tet_solver: str = "semi_implicit"
-        """Tetrahedral solve path: ``semi_implicit`` or the Style3D ``pcg`` path."""
+        """Tet path: semi_implicit/pcg use SIPD; pd uses a scalar PD approximation.
+
+        The pd material matches Stable Neo-Hookean to second order at rest.
+        Material damping uses the VBD metric law, independently of collision.
+        Recreate the solver after changing this mode or its elastic material.
+        """
+
+        tet_pd_volume_ratio: float = 1.0
+        """Multiplier of the matched 3*lambda isochoric PD weight; zero disables it. Rebuild to change."""
 
         tet_sipd_relaxation: float = 1.0
         """Under-relax each nonlinear SIPD position update."""
@@ -180,7 +190,11 @@ class SolverStyle3D(SolverBase):
     @property
     def _use_sipd_tets(self) -> bool:
         """Whether the runtime should evaluate the SIPD tetrahedron path."""
-        return bool(self._has_tet_elements and self.config.enable_tet_sipd)
+        return bool(self._has_tet_elements and self.config.enable_tet_sipd and self.config.tet_solver != "pd")
+
+    @property
+    def _use_pd_tets(self) -> bool:
+        return bool(self._has_tet_elements and self.config.enable_tet_sipd and self.config.tet_solver == "pd")
 
     @property
     def _use_sipd_semi_implicit(self) -> bool:
@@ -320,8 +334,10 @@ class SolverStyle3D(SolverBase):
                 "Call SolverStyle3D.register_custom_attributes() before building the model."
             )
         self.style3d = model.style3d
-        if config.tet_solver not in ("semi_implicit", "pcg"):
-            raise ValueError("tet_solver must be 'semi_implicit' or 'pcg'")
+        if not 0.0 <= config.tet_pd_volume_ratio < float("inf"):
+            raise ValueError("tet_pd_volume_ratio must be finite and nonnegative")
+        if config.tet_solver not in ("semi_implicit", "pcg", "pd"):
+            raise ValueError("tet_solver must be 'semi_implicit', 'pcg', or 'pd'")
         # Keep solver-specific activity constraints out of the shared model.
         self._particle_flags = wp.clone(model.particle_flags)
         if model.particle_count > 0:
@@ -356,6 +372,8 @@ class SolverStyle3D(SolverBase):
         self.pd_non_diags = SparseMatrixELL()
         self.pd_diags = wp.zeros(model.particle_count, dtype=float, device=self.device)
         self._precompute(model)
+        self._matrix_tet_solver = config.tet_solver
+        self._matrix_volume_ratio = config.tet_pd_volume_ratio
 
         # Non-linear equation variables
         self.dx = wp.zeros(model.particle_count, dtype=wp.vec3, device=self.device)
@@ -368,6 +386,9 @@ class SolverStyle3D(SolverBase):
         self.inv_A_diags = wp.zeros(model.particle_count, dtype=wp.mat33, device=self.device)
         self.A_diags = wp.zeros(model.particle_count, dtype=wp.mat33, device=self.device)
         self._zero_contact_hessian = wp.zeros(model.particle_count, dtype=wp.mat33, device=self.device)
+        self.material_damping = MaterialDamping(model)
+        self._dynamic_hessian = wp.zeros(model.particle_count, dtype=wp.mat33, device=self.device)
+        self._dynamic_Hx = wp.zeros(model.particle_count, dtype=wp.vec3, device=self.device)
 
         # Drag info
         self.drag_pos = wp.zeros(1, dtype=wp.vec3, device=self.device)
@@ -411,6 +432,11 @@ class SolverStyle3D(SolverBase):
 
         if self.config.iterations < 1:
             raise ValueError(f"Config.iterations must be at least 1, got {self.config.iterations}.")
+        if (
+            self.config.tet_solver != self._matrix_tet_solver
+            or self.config.tet_pd_volume_ratio != self._matrix_volume_ratio
+        ):
+            raise ValueError("Recreate SolverStyle3D after changing tet_solver or tet_pd_volume_ratio.")
 
         # Model masses and flags may change between solver steps.
         wp.copy(self._particle_flags, self.model.particle_flags)
@@ -422,9 +448,6 @@ class SolverStyle3D(SolverBase):
                 outputs=[self._particle_flags],
                 device=self.device,
             )
-
-        if self.collision is not None:
-            self.collision.frame_begin(state_in.particle_q, state_in.particle_qd, dt)
 
         wp.launch(
             kernel=init_step_kernel,
@@ -449,11 +472,10 @@ class SolverStyle3D(SolverBase):
             device=self.device,
         )
 
-        if self._use_sipd_semi_implicit:
-            # Match VBD's inertial predictor as the first iterate. Starting at
-            # the old pose attenuates free flight when the iteration budget is
-            # small; fixed vertices already have x_inertia == x_prev.
-            state_in.particle_q.assign(self.x_inertia)
+        # Begin at the inertial predictor for every solve path. Uniform free
+        # flight then needs no elastic correction, even with a finite budget.
+        state_in.particle_q.assign(self.x_inertia)
+        self.dx.zero_()
 
         if self.config.enable_mouse_dragging:
             wp.launch(
@@ -471,6 +493,12 @@ class SolverStyle3D(SolverBase):
             )
 
         for _iter in range(self.config.iterations):
+            # The current iterate changes after every nonlinear solve. Rebuild
+            # broad-phase candidates here so cloth/soft-body contacts are not
+            # evaluated from the positions that preceded the inertial predictor.
+            if self.collision is not None:
+                self.collision.frame_begin(state_in.particle_q, state_in.particle_qd, dt)
+
             if self._use_sipd_semi_implicit:
                 self.rhs.zero_()
             else:
@@ -502,6 +530,7 @@ class SolverStyle3D(SolverBase):
                     device=self.device,
                 )
 
+            if self.config.enable_surface_constraints:
                 wp.launch(
                     eval_bend_kernel,
                     dim=len(self.style3d.edge_rest_area),
@@ -511,6 +540,21 @@ class SolverStyle3D(SolverBase):
                         self.style3d.edge_bending_cot,
                         self.model.edge_indices,
                         self.model.edge_bending_properties,
+                    ],
+                    outputs=[self.rhs],
+                    device=self.device,
+                )
+
+            if self._use_pd_tets:
+                wp.launch(
+                    eval_tet_pd_constraint_kernel,
+                    dim=self.model.tet_count,
+                    inputs=[
+                        state_in.particle_q,
+                        self.model.tet_indices,
+                        self.model.tet_poses,
+                        self.model.tet_materials,
+                        self.config.tet_pd_volume_ratio,
                     ],
                     outputs=[self.rhs],
                     device=self.device,
@@ -563,71 +607,31 @@ class SolverStyle3D(SolverBase):
                     self.x_prev,
                     self.static_A_diags,
                 )
-                if self._use_sipd_tets:
-                    wp.launch(
-                        build_sipd_matrix_diags_kernel,
-                        dim=self.model.particle_count,
-                        inputs=[self.static_A_diags, self.sipd_A_diag, self.sipd_A_upper],
-                        outputs=[self.A_diags],
-                        device=self.device,
-                    )
-                    wp.launch(
-                        prepare_jacobi_preconditioner_matrix_kernel,
-                        dim=self.model.particle_count,
-                        inputs=[
-                            self.A_diags,
-                            self.static_A_diags,
-                            self.collision.contact_hessian_diagonal(),
-                            self._particle_flags,
-                        ],
-                        outputs=[self.inv_A_diags],
-                        device=self.device,
-                    )
-                else:
-                    wp.launch(
-                        prepare_jacobi_preconditioner_kernel,
-                        dim=self.model.particle_count,
-                        inputs=[
-                            self.static_A_diags,
-                            self.collision.contact_hessian_diagonal(),
-                            self._particle_flags,
-                        ],
-                        outputs=[self.inv_A_diags],
-                        device=self.device,
-                    )
-            else:
-                if self._use_sipd_semi_implicit:
-                    contact_hessian = self._zero_contact_hessian
-                elif self._use_sipd_tets:
-                    wp.launch(
-                        build_sipd_matrix_diags_kernel,
-                        dim=self.model.particle_count,
-                        inputs=[self.static_A_diags, self.sipd_A_diag, self.sipd_A_upper],
-                        outputs=[self.A_diags],
-                        device=self.device,
-                    )
-                    wp.launch(
-                        prepare_jacobi_preconditioner_matrix_no_contact_kernel,
-                        dim=self.model.particle_count,
-                        inputs=[self.A_diags, self.static_A_diags],
-                        outputs=[self.inv_A_diags],
-                        device=self.device,
-                    )
-                else:
-                    wp.launch(
-                        prepare_jacobi_preconditioner_no_contact_hessian_kernel,
-                        dim=self.model.particle_count,
-                        inputs=[self.static_A_diags],
-                        outputs=[self.inv_A_diags],
-                        device=self.device,
-                    )
+
+            # SIPD already includes its tetrahedral damping in the force kernel.
+            # Surface damping and scalar-PD tet damping are assembled exactly once.
+            self.material_damping.assemble(
+                state_in.particle_q,
+                self.x_prev,
+                dt,
+                self.rhs,
+                self._particle_flags,
+                surface=self.config.enable_surface_constraints,
+                tets=self._use_pd_tets,
+                local=self._use_sipd_semi_implicit,
+            )
+            contact_hessian = (
+                self.collision.contact_hessian_diagonal() if self.collision is not None else self._zero_contact_hessian
+            )
+            wp.launch(
+                add_diagonal_kernel,
+                dim=self.model.particle_count,
+                inputs=[contact_hessian, self.material_damping.diagonal],
+                outputs=[self._dynamic_hessian],
+                device=self.device,
+            )
 
             if self._use_sipd_semi_implicit:
-                contact_hessian = (
-                    self.collision.contact_hessian_diagonal()
-                    if self.collision is not None
-                    else self._zero_contact_hessian
-                )
                 wp.launch(
                     sipd_semi_implicit_solve_kernel,
                     dim=self.model.particle_count,
@@ -638,7 +642,8 @@ class SolverStyle3D(SolverBase):
                         self.rhs,
                         self.sipd_A_diag,
                         self.sipd_A_upper,
-                        contact_hessian,
+                        self.pd_diags,
+                        self._dynamic_hessian,
                         self.model.particle_mass,
                         self._particle_flags,
                         self.config.tet_sipd_relaxation,
@@ -653,6 +658,26 @@ class SolverStyle3D(SolverBase):
 
             A_diag = self.A_diags if self._use_sipd_tets else self.static_A_diags
 
+            if self._use_sipd_tets:
+                wp.launch(
+                    build_sipd_matrix_diags_kernel,
+                    dim=self.model.particle_count,
+                    inputs=[self.static_A_diags, self.sipd_A_diag, self.sipd_A_upper],
+                    outputs=[self.A_diags],
+                    device=self.device,
+                )
+            wp.launch(
+                prepare_jacobi_preconditioner_matrix_kernel if self._use_sipd_tets else prepare_jacobi_preconditioner_kernel,
+                dim=self.model.particle_count,
+                inputs=(
+                    [self.A_diags, self.static_A_diags, self._dynamic_hessian, self._particle_flags]
+                    if self._use_sipd_tets
+                    else [self.static_A_diags, self._dynamic_hessian, self._particle_flags]
+                ),
+                outputs=[self.inv_A_diags],
+                device=self.device,
+            )
+
             self.linear_solver.solve(
                 self.pd_non_diags,
                 A_diag,
@@ -661,7 +686,7 @@ class SolverStyle3D(SolverBase):
                 self.inv_A_diags,
                 self.dx,
                 self.config.linear_iterations,
-                None if self.collision is None else self.collision.hessian_multiply,
+                self._multiply_dynamic_hessian,
             )
 
             if self.collision is not None:
@@ -694,6 +719,34 @@ class SolverStyle3D(SolverBase):
     def rebuild_bvh(self, state: State):
         if self.collision is not None:
             self.collision.rebuild_bvh(state.particle_q)
+
+    @override
+    def coupling_harvest_proxy_wrenches(
+        self,
+        body_local_to_proxy_global: wp.array[int],
+        out_body_f: wp.array[wp.spatial_vector],
+        *,
+        body_qd_before: wp.array[wp.spatial_vector],
+        state: State,
+        state_out: State,
+        contacts: Contacts | None,
+        dt: float,
+    ) -> None:
+        """Return particle/body contact reactions to proxy-owned rigid bodies."""
+        del body_qd_before, state, state_out, contacts, dt
+        out_body_f.zero_()
+        if self.collision is None or body_local_to_proxy_global.shape[0] == 0:
+            return
+        wp.launch(
+            scatter_proxy_body_wrenches_kernel,
+            dim=body_local_to_proxy_global.shape[0],
+            inputs=[
+                body_local_to_proxy_global,
+                self.collision.body_contact_wrenches,
+            ],
+            outputs=[out_body_f],
+            device=self.device,
+        )
 
     @override
     @classmethod
@@ -772,6 +825,13 @@ class SolverStyle3D(SolverBase):
                 if self.config.enable_surface_constraints:
                     matrix.add_stretch_constraints(tri_indices, tri_poses, tri_aniso_ke, tri_areas)
                     matrix.add_bend_constraints(edge_indices, edge_bending_properties, edge_rest_area, edge_bending_cot)
+                if self._use_pd_tets:
+                    matrix.add_tet_pd_constraints(
+                        model.tet_indices.numpy(),
+                        model.tet_poses.numpy(),
+                        model.tet_materials.numpy(),
+                        volume_ratio=self.config.tet_pd_volume_ratio,
+                    )
                 return matrix
 
             try:
@@ -779,8 +839,28 @@ class SolverStyle3D(SolverBase):
             except ValueError:
                 # Only overflowing meshes pay for counting stretch and bending connections.
                 max_neighbors = _compute_max_neighbors(model.particle_count, tri_indices, edge_indices)
+                if self._use_pd_tets:
+                    adjacency = [set() for _ in range(model.particle_count)]
+                    for tet in model.tet_indices.numpy():
+                        for vertex in tet:
+                            adjacency[int(vertex)].update(int(other) for other in tet if other != vertex)
+                    max_neighbors += max((len(row) for row in adjacency), default=0)
                 pd_matrix_builder = assemble(max_neighbors)
             self.pd_diags, self.pd_non_diags.num_nz, self.pd_non_diags.nz_ell = pd_matrix_builder.finalize(self.device)
+
+    def _multiply_dynamic_hessian(self, x: wp.array[wp.vec3]):
+        """Apply contact blocks plus the complete material damping operator."""
+        material_Hx = self.material_damping.multiply(x)
+        if self.collision is None:
+            return material_Hx
+        wp.launch(
+            add_vectors_kernel,
+            dim=self.model.particle_count,
+            inputs=[self.collision.hessian_multiply(x), material_Hx],
+            outputs=[self._dynamic_Hx],
+            device=self.device,
+        )
+        return self._dynamic_Hx
 
     def _update_drag_info(self, index: int, pos: wp.vec3, bary_coord: wp.vec3):
         """Should be invoked when state changed."""

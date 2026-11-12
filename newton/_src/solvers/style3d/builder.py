@@ -285,3 +285,54 @@ class PDMatrixBuilder:
             device=device,
         )
         return diag, num_nz, nz_ell
+
+    def add_tet_pd_constraints(self, tet_indices, tet_poses, tet_materials, *, volume_ratio=0.0):
+        """Assemble the Stable-Neo-Hookean-matched scalar tet PD operator.
+
+        ``K_ij=V*(2*mu + 3*lambda*volume_ratio)*dot(grad(N_i),grad(N_j))``.
+        At ``volume_ratio=1``, the rotation and isochoric projections match
+        the quadratic Stable Neo-Hookean energy at the rest configuration.
+
+        The implied spatial block is K_ij*I, preserving the ELL float path.
+        Reference geometry and material changes require rebuilding this matrix.
+        """
+        if not np.isfinite(volume_ratio) or volume_ratio < 0.0:
+            raise ValueError("Tetrahedral PD volume ratio must be finite and nonnegative.")
+        tet_indices = np.asarray(tet_indices, dtype=np.int32).reshape(-1, 4)
+        tet_poses = np.asarray(tet_poses).reshape(-1, 3, 3)
+        tet_materials = np.asarray(tet_materials).reshape(-1, 3)
+        determinants = np.linalg.det(tet_poses)
+        if np.any(~np.isfinite(determinants)) or np.any(determinants <= 0.0):
+            raise ValueError("Tetrahedral PD requires finite, positively oriented rest tetrahedra.")
+        if np.any(~np.isfinite(tet_materials)) or np.any(tet_materials < 0.0):
+            raise ValueError("Tetrahedral PD material coefficients must be finite and nonnegative.")
+        if np.any(tet_indices < 0) or np.any(tet_indices >= self.num_verts):
+            raise ValueError("Tetrahedral PD indices must reference existing particles.")
+        counts = self.counts.numpy()
+        neighbors = self.neighbors.numpy()
+        values = self.values.numpy()
+        diags = self.diags.numpy()
+        for tet, inv_dm, material in zip(tet_indices, tet_poses, tet_materials, strict=True):
+            gradients = np.vstack((-inv_dm.sum(axis=0), inv_dm))
+            volume = 1.0 / (6.0 * np.linalg.det(inv_dm))
+            scalar_weight = 2.0 * material[0] + 3.0 * material[1] * volume_ratio
+            stiffness = volume * scalar_weight * (gradients @ gradients.T)
+            for i in range(4):
+                row = int(tet[i])
+                diags[row] += stiffness[i, i]
+                for j in range(4):
+                    if i == j:
+                        continue
+                    col = int(tet[j])
+                    slots = np.flatnonzero(neighbors[row, : counts[row]] == col)
+                    slot = int(slots[0]) if len(slots) else int(counts[row])
+                    if slot >= self.max_neighbors:
+                        raise ValueError(f"PD matrix capacity {self.max_neighbors} exceeded at vertex {row}.")
+                    if not len(slots):
+                        neighbors[row, slot] = col
+                        counts[row] += 1
+                    values[row, slot] += stiffness[i, j]
+        self.counts.assign(counts)
+        self.neighbors.assign(neighbors)
+        self.values.assign(values)
+        self.diags.assign(diags)
