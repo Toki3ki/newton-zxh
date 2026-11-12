@@ -5,7 +5,10 @@
 
 This simulation demonstrates volumetric soft bodies (tetrahedral grids) hanging
 from fixed particles on the left side. Four grids with different damping values
-(1e4 to 1e1) showcase the effect of damping on Neo-Hookean elastic behavior.
+(1e4 to 1e1) showcase damping when --damping is enabled. With --no-damping
+(the default), all four material damping coefficients are zero.
+With --solver style3d, the same geometry uses SIPD tetrahedral elasticity
+and the same objective material damping law.
 
 Success criteria:
 - 4 hanging elongated softbodies appear with different damping values.
@@ -14,7 +17,12 @@ Success criteria:
 
 Runs:
 - `python -m newton.examples softbody_hanging`
+- `python -m newton.examples softbody_hanging --solver style3d`
+- `python -m newton.examples softbody_hanging --solver vbd --no-damping`
+- `python -m newton.examples softbody_hanging --solver vbd --damping`
 """
+
+import argparse
 
 import warp as wp
 
@@ -33,10 +41,9 @@ class Example:
         self.iterations = 10
         self.sim_dt = self.frame_dt / self.sim_substeps
 
-        if self.solver_type != "vbd":
-            raise ValueError("The hanging softbody example only supports the VBD solver.")
-
         builder = newton.ModelBuilder()
+        if self.solver_type == "style3d":
+            newton.solvers.SolverStyle3D.register_custom_attributes(builder)
         builder.add_ground_plane()
 
         # Grid dimensions
@@ -45,8 +52,9 @@ class Example:
         dim_z = 4
         cell_size = 0.1
 
-        # Create 4 grids with different damping values
-        damping_values = [1e4, 1e3, 1e2, 1e1]
+        # --damping restores the original four material damping coefficients.
+        self.damping_enabled = args.damping
+        damping_values = [1e4, 1e3, 1e2, 1e1] if self.damping_enabled else [0.0] * 4
         spacing = 0.6  # Space between grids along Y-axis
 
         for i, k_damp in enumerate(damping_values):
@@ -68,7 +76,7 @@ class Example:
                 fix_left=True,
             )
 
-        # Color the mesh for VBD solver
+        # Surface triangles and edges are retained for visualization/collision.
         builder.color()
 
         self.model = builder.finalize()
@@ -76,12 +84,27 @@ class Example:
         self.model.soft_contact_kd = 0
         self.model.soft_contact_mu = 1.0
 
-        self.solver = newton.solvers.SolverVBD(
-            model=self.model,
-            iterations=self.iterations,
-            particle_enable_self_contact=False,
-            particle_enable_tile_solve=False,
-        )
+        if self.solver_type == "vbd":
+            self.solver = newton.solvers.SolverVBD(
+                model=self.model,
+                iterations=self.iterations,
+                particle_enable_self_contact=False,
+                particle_enable_tile_solve=False,
+            )
+        elif self.solver_type == "style3d":
+            self.solver = newton.solvers.SolverStyle3D(
+                model=self.model,
+                config=newton.solvers.SolverStyle3D.Config(
+                    iterations=8,
+                    linear_iterations=8,
+                    enable_surface_constraints=False,
+                    enable_tet_sipd=True,
+                    tet_solver="semi_implicit",
+                    tet_sipd_relaxation=1.0,
+                ),
+            )
+        else:
+            raise ValueError(f"Unknown solver type: {self.solver_type}")
 
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
@@ -92,7 +115,10 @@ class Example:
 
         self.viewer.set_model(self.model)
 
-        self.capture()
+        # Keep the original VBD capture path; the SIPD demo steps eagerly.
+        self.graph = None
+        if self.solver_type == "vbd":
+            self.capture()
 
     def capture(self):
         with wp.ScopedCapture() as capture:
@@ -140,15 +166,25 @@ class Example:
         self.viewer.log_contacts(self.contacts, self.state_0)
         self.viewer.end_frame()
 
+    def gui(self, ui):
+        ui.text(f"Material damping: {'ON (10000, 1000, 100, 10 Pa s)' if self.damping_enabled else 'OFF'}")
+        ui.text("Use --damping or --no-damping when launching this example.")
+
     @staticmethod
     def create_parser():
         parser = newton.examples.create_parser()
         parser.add_argument(
             "--solver",
-            help="Type of solver (only 'vbd' supports volumetric soft bodies)",
+            help="Solver used for the tetrahedral hanging-body scene",
             type=str,
-            choices=["vbd"],
+            choices=["vbd", "style3d"],
             default="vbd",
+        )
+        parser.add_argument(
+            "--damping",
+            action=argparse.BooleanOptionalAction,
+            default=False,
+            help="Enable the original material damping values (1e4, 1e3, 1e2, 1e1 Pa s); default off",
         )
         return parser
 

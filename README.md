@@ -1006,6 +1006,9 @@ python -m newton.examples --describe robot_omniwheel
       </a>
     </td>
     <td align="center" width="33%">
+      <a href="newton/examples/softbody/example_softbody_hanging_compare.py">
+        VBD and SIPD Hanging Comparison
+      </a>
     </td>
   </tr>
   <tr>
@@ -1016,6 +1019,7 @@ python -m newton.examples --describe robot_omniwheel
       <code>python -m newton.examples softbody_franka</code>
     </td>
     <td align="center" width="33%">
+      <code>python -m newton.examples softbody_hanging_compare</code>
     </td>
   </tr>
   <tr>

@@ -225,7 +225,12 @@ class PDMatrixBuilder:
         edge_inds = np.array(edge_indices).reshape(-1, 4)
         edge_area = np.array(edge_rest_area)
         edge_prop = np.array(edge_bending_properties).reshape(-1, 2)
-        edge_stiff = edge_prop[:, 0] * (3.0 / edge_area)
+        # Surface helper meshes may contain zero-area/zero-stiffness edge
+        # records. Avoid producing NaNs through 0 * inf; the kernel ignores
+        # invalid edge stencils and a zero stiffness contributes nothing.
+        edge_stiff = np.zeros_like(edge_area, dtype=np.float32)
+        valid_area = edge_area > 0.0
+        edge_stiff[valid_area] = edge_prop[valid_area, 0] * (3.0 / edge_area[valid_area])
 
         bend_cot = np.array(edge_bending_cot).reshape(-1, 4)
         bend_weight = np.zeros(shape=(num_edge, 4), dtype=np.float32)

@@ -10,6 +10,7 @@ import warp as wp
 
 import newton
 from newton._src.solvers.style3d.builder import PDMatrixBuilder, _compute_max_neighbors
+from newton._src.solvers.style3d.kernels import eval_tet_sipd_force_kernel, initialize_tet_inv_qa_kernel
 from newton.exceptions import NewtonDeprecationWarning
 from newton.tests.unittest_utils import add_function_test, get_test_devices
 
@@ -448,6 +449,153 @@ def test_global_particles_use_global_gravity(test, device):
     test.assertTrue(np.all(state_1.particle_qd.numpy()[:, 2] < -1.0e-6))
 
 
+def test_tet_sipd_preserves_undamped_translation(test, device):
+    """Preserve uniform velocity and displacement in an unconstrained elastic tetrahedral grid."""
+    velocity = np.array((0.25, -0.125, 0.5), dtype=np.float32)
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    newton.solvers.SolverStyle3D.register_custom_attributes(builder)
+    builder.add_soft_grid(
+        pos=wp.vec3(0.0, 0.0, 1.0),
+        rot=wp.quat_identity(),
+        vel=wp.vec3(*velocity),
+        dim_x=1,
+        dim_y=1,
+        dim_z=1,
+        cell_x=0.5,
+        cell_y=0.5,
+        cell_z=0.5,
+        density=1.0e3,
+        k_mu=1.0e5,
+        k_lambda=1.0e5,
+        k_damp=0.0,
+    )
+    model = builder.finalize(device=device)
+    solver = newton.solvers.SolverStyle3D(
+        model,
+        config=newton.solvers.SolverStyle3D.Config(
+            iterations=1,
+            enable_surface_constraints=False,
+            enable_tet_sipd=True,
+            tet_solver="semi_implicit",
+            tet_sipd_relaxation=1.0,
+        ),
+    )
+    state_0, state_1 = model.state(), model.state()
+    contacts = newton.CollisionPipeline(model).contacts()
+    control = model.control()
+    initial_positions = state_0.particle_q.numpy().copy()
+    expected_velocity = np.broadcast_to(velocity, initial_positions.shape)
+    dt = 1.0 / 64.0
+
+    for step in range(8):
+        state_0.clear_forces()
+        solver.step(state_0, state_1, control, contacts, dt)
+        expected_positions = initial_positions + ((step + 1) * dt) * velocity
+        np.testing.assert_allclose(state_1.particle_q.numpy(), expected_positions, rtol=0.0, atol=1.0e-6)
+        np.testing.assert_allclose(state_1.particle_qd.numpy(), expected_velocity, rtol=0.0, atol=2.0e-5)
+        state_0, state_1 = state_1, state_0
+
+
+def test_tet_sipd_force_matches_energy_gradient(test, device):
+    """Match physical SIPD forces to finite differences of the tetrahedral elastic energy."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    newton.solvers.SolverStyle3D.register_custom_attributes(builder)
+    for point in ((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)):
+        builder.add_particle(point, (0.0, 0.0, 0.0), 1.0)
+    builder.add_tetrahedron(0, 1, 2, 3, 100.0, 200.0, 0.0)
+    model = builder.finalize(device=device)
+    inv_qa = wp.zeros(4, dtype=wp.vec3, device=device)
+    wp.launch(
+        initialize_tet_inv_qa_kernel,
+        dim=1,
+        inputs=[model.particle_q, model.tet_indices],
+        outputs=[inv_qa],
+        device=device,
+    )
+    q = np.array(((0.1, 0.2, 0.3), (1.2, 0.25, 0.3), (0.2, 1.1, 0.3), (0.1, 0.3, 1.4)))
+    pos = wp.array(q.astype(np.float32), dtype=wp.vec3, device=device)
+    force = wp.zeros(4, dtype=wp.vec3, device=device)
+    diag, upper = wp.zeros_like(force), wp.zeros_like(force)
+    wp.launch(
+        eval_tet_sipd_force_kernel,
+        dim=1,
+        inputs=[
+            pos,
+            model.particle_q,
+            model.tet_indices,
+            model.tet_poses,
+            model.tet_materials,
+            inv_qa,
+            0.01,
+            model.particle_q,
+        ],
+        outputs=[force, diag, upper],
+        device=device,
+    )
+
+    def energy(x):
+        F = np.column_stack((x[1] - x[0], x[2] - x[0], x[3] - x[0]))
+        J = np.linalg.det(F)
+        return (50.0 * (np.sum(F * F) - 3.0) - 100.0 * (J - 1.0) + 150.0 * (J - 1.0) ** 2) / 6.0
+
+    expected = np.zeros_like(q)
+    epsilon = 1.0e-5
+    for vertex in range(4):
+        for axis in range(3):
+            plus, minus = q.copy(), q.copy()
+            plus[vertex, axis] += epsilon
+            minus[vertex, axis] -= epsilon
+            expected[vertex, axis] = -(energy(plus) - energy(minus)) / (2.0 * epsilon)
+    actual = force.numpy()
+    np.testing.assert_allclose(actual, expected, rtol=2.0e-5, atol=2.0e-5)
+    np.testing.assert_allclose(actual.sum(axis=0), 0.0, atol=2.0e-5)
+
+
+def test_tet_sipd_ground_contact_is_repulsive(test, device):
+    """Move a penetrating tetrahedral grid away from the ground under SIPD contact forces."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    newton.solvers.SolverStyle3D.register_custom_attributes(builder)
+    builder.add_ground_plane()
+    builder.add_soft_grid(
+        pos=wp.vec3(0.0, 0.0, 0.05),
+        rot=wp.quat_identity(),
+        vel=wp.vec3(0.0),
+        dim_x=1,
+        dim_y=1,
+        dim_z=1,
+        cell_x=0.2,
+        cell_y=0.2,
+        cell_z=0.2,
+        density=1000.0,
+        k_mu=0.0,
+        k_lambda=0.0,
+        k_damp=0.0,
+        particle_radius=0.1,
+    )
+    model = builder.finalize(device=device)
+    model.soft_contact_ke = 1000.0
+    model.soft_contact_kd = 0.0
+    model.soft_contact_mu = 0.0
+    solver = newton.solvers.SolverStyle3D(
+        model,
+        config=newton.solvers.SolverStyle3D.Config(
+            iterations=1,
+            enable_surface_constraints=False,
+            tet_solver="semi_implicit",
+        ),
+    )
+    solver.collision.stiff_vf = solver.collision.stiff_ee = solver.collision.stiff_ef = 0.0
+    state_in, state_out = model.state(), model.state()
+    before = state_in.particle_q.numpy().copy()
+    pipeline = newton.CollisionPipeline(model)
+    contacts = pipeline.contacts()
+    pipeline.collide(state_in, contacts)
+    test.assertGreater(int(contacts.soft_contact_count.numpy()[0]), 0)
+    solver.step(state_in, state_out, model.control(), contacts, 0.01)
+    after = state_out.particle_q.numpy()
+    test.assertTrue(np.all(after[before[:, 2] < 0.1, 2] > before[before[:, 2] < 0.1, 2]))
+
+
 devices = get_test_devices()
 
 
@@ -511,6 +659,30 @@ add_function_test(
     TestSolverStyle3D,
     "test_global_particles_use_global_gravity",
     test_global_particles_use_global_gravity,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverStyle3D,
+    "test_tet_sipd_preserves_undamped_translation",
+    test_tet_sipd_preserves_undamped_translation,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverStyle3D,
+    "test_tet_sipd_force_matches_energy_gradient",
+    test_tet_sipd_force_matches_energy_gradient,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverStyle3D,
+    "test_tet_sipd_ground_contact_is_repulsive",
+    test_tet_sipd_ground_contact_is_repulsive,
     devices=devices,
     check_output=False,
 )
