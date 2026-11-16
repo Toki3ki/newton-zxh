@@ -73,6 +73,7 @@ from ..geometry.inertia import (
     _INERTIA_ABS_FLOOR,
     _INERTIA_REL_TOL,
     _inverse_inertia,
+    _validate_hollow_thickness,
     compute_body_inverses_kernel,
     validate_and_correct_inertia_kernel,
     verify_and_correct_inertia,
@@ -1654,6 +1655,9 @@ class ModelBuilder:
         default: Any = None
         """Default value for the attribute. If None, the default value is determined based on the dtype."""
 
+        keep_empty: bool = False
+        """Whether finalize() should expose a typed zero-length array when this frequency has no rows."""
+
         values: dict[int, Any] | list[Any] | None = None
         """Storage for specific values (overrides).
 
@@ -2824,6 +2828,7 @@ class ModelBuilder:
             and existing.dtype == incoming.dtype
             and existing.assignment == incoming.assignment
             and existing.namespace == incoming.namespace
+            and existing.keep_empty == incoming.keep_empty
             and Model._normalize_attribute_reference(existing.references)
             == Model._normalize_attribute_reference(incoming.references)
             and existing.reference_value_transformer is incoming.reference_value_transformer
@@ -5668,10 +5673,18 @@ class ModelBuilder:
                 See :ref:`custom_attributes` for details on custom attributes. If False (default), position/velocity
                 actuators use :attr:`~newton.solvers.SolverMuJoCo.CtrlSource.JOINT_TARGET` mode where control comes
                 from :attr:`newton.Control.joint_target_q` and :attr:`newton.Control.joint_target_qd`.
-                For position-only drives using ``dampratio``, constructing
+                A scalar ``gear`` on a one-DOF (hinge or slide) position/velocity actuator is folded into the
+                joint-target drive, so the targets stay in joint units: the actuator is imported with unit gear, ``kp``,
+                ``kv``, ``damping`` and ``armature`` are scaled by ``gear**2``, ``forcerange`` by ``gear`` and ``ctrlrange``
+                by ``1 / gear`` (bounds swapped for a negative ``gear``). Position/velocity actuators whose gear cannot be
+                folded (a gear on a multi-DOF joint, a vector gear or a zero gear) are imported as
+                :attr:`~newton.solvers.SolverMuJoCo.CtrlSource.CTRL_DIRECT` so that MuJoCo applies the gear.
+                For position-only joint-target drives using ``dampratio``, constructing
                 :class:`~newton.solvers.SolverMuJoCo` initializes zero entries in
                 :attr:`newton.Model.joint_target_kd` with the resolved damping coefficients.
                 Subsequent damping edits use ``joint_target_kd`` as usual.
+                This does not apply to ``CTRL_DIRECT`` actuators: their gains stay in the MuJoCo actuator (in actuator
+                units), and ``joint_target_kd`` is neither written nor read for them.
             path_resolver: Callback to resolve file paths. Takes (base_dir, file_path) and returns a resolved path. For <include> elements, can return either a file path or XML content directly. For asset elements (mesh, texture, etc.), must return an absolute file path. By default, assets are searched relative to the main model with the compiler asset directory, then relative to the included file without that directory prefix, and finally relative to the included file with it. Custom resolvers receive the authoring file's directory and the file path with that file's compiler asset directory prefix.
             legacy_margin_gap: If True, restore pre-MuJoCo-3.9 import behavior
                 where ``shape_margin`` is computed as ``mj_margin - mj_gap``.
@@ -10746,6 +10759,7 @@ class ModelBuilder:
         rod: Rod,
         *,
         cfg: ShapeConfig | None,
+        total_mass: float | None,
         stretch_stiffness: float | None,
         stretch_damping: float | None,
         shear_stiffness: float | None,
@@ -10818,6 +10832,7 @@ class ModelBuilder:
                 quaternions=rod_quaternions,
                 radius=radius,
                 cfg=cfg,
+                total_mass=total_mass,
                 stretch_stiffness=stretch_stiffness,
                 stretch_damping=stretch_damping,
                 shear_stiffness=shear_stiffness,
@@ -10840,6 +10855,7 @@ class ModelBuilder:
                 edges=[(int(edge[0]), int(edge[1])) for edge in rod_edges],
                 radius=radius,
                 cfg=cfg,
+                total_mass=total_mass,
                 stretch_stiffness=stretch_stiffness,
                 stretch_damping=stretch_damping,
                 shear_stiffness=shear_stiffness,
@@ -10884,6 +10900,7 @@ class ModelBuilder:
         rest_straight: bool = False,
         radius: float,
         cfg: ShapeConfig | None,
+        total_mass: float | None,
         stretch_stiffness: float | None,
         stretch_damping: float | None,
         shear_stiffness: float | None,
@@ -10930,6 +10947,7 @@ class ModelBuilder:
             rest_node_positions=rest_positions_wp if rest_positions is not None else None,
             radius=radius,
             cfg=cfg,
+            total_mass=total_mass,
             stretch_stiffness=stretch_stiffness,
             stretch_damping=stretch_damping,
             shear_stiffness=shear_stiffness,
@@ -11045,6 +11063,7 @@ class ModelBuilder:
         *,
         rod: Rod,
         cfg: ShapeConfig | None = None,
+        total_mass: float | None = None,
         stretch_stiffness: float | None = None,
         stretch_damping: float | None = None,
         shear_stiffness: float | None = None,
@@ -11058,6 +11077,7 @@ class ModelBuilder:
         color: Vec3 | None = None,
         body_frame_origin: Literal["start", "com"] = "com",
         junction_collision_filter: bool = True,
+        particle_based: bool = False,
     ) -> tuple[list[int], list[int]]:
         """Adds a rod composed of capsule bodies connected by rod joints.
 
@@ -11075,7 +11095,14 @@ class ModelBuilder:
 
         Args:
             rod: Initial/rest geometry, frame, topology, and constitutive-data source.
+            particle_based: Experimental centerline-particle representation for Style3D.
+                Capsules remain the collision and rendering geometry. Leave this disabled for rigid-body solvers.
             cfg: Shape configuration for the capsules. If None, :attr:`default_shape_cfg` is used.
+            total_mass: Optional total rod mass [kg], distributed in proportion to each segment's
+                rest volume (equivalently, rest length for the uniform cross section).
+                Overrides ``cfg.density``. Must be finite and nonnegative; zero sets every
+                segment's mass and inertia to zero without setting the kinematic body flag.
+                If None, mass is derived from density.
             stretch_stiffness: Per-joint rod stretch stiffness, stored directly as ``target_ke`` [N/m].
                 If None, it is derived locally from Rod material or section rigidity;
                 otherwise it defaults to 1.0e5.
@@ -11148,6 +11175,10 @@ class ModelBuilder:
             ValueError: If the structural-rest centerline of a closed chain does not close.
             ValueError: If the Rod uses ``rest_straight`` with explicit rest inputs or a graph.
             ValueError: If ``body_frame_origin`` is not ``"start"`` or ``"com"``.
+            ValueError: If ``total_mass`` is negative or non-finite.
+            ValueError: If a hollow rod with positive assigned mass has a negative or non-finite
+                wall thickness ``cfg.margin``, or one at least as large as the stored radius.
+                A positive ``total_mass`` also requires nonzero hollow wall thickness.
             ValueError: If automatic section-rigidity discretization is requested
                 for branching topology or for a wrapped explicit cycle.
 
@@ -11162,6 +11193,12 @@ class ModelBuilder:
               arguments override the derived value per mode.
             - Each segment is implemented as a capsule primitive. ``half_height`` is the half-length of
               the cylindrical centerline, excluding the hemispherical caps.
+            - Density-based mass is ``cfg.density * area * rest_length`` per segment, excluding the
+              overlapping caps. ``area`` is the circular cross section ``pi * radius**2``, as in USD
+              cable import, or for hollow rods the tube wall of thickness ``cfg.margin``.
+            - Inertia uses the solid-cylinder or open-tube tensor at each segment's assigned mass
+              and rest length, as in USD cable import for solid sections. Collision geometry and
+              the caller's ``cfg`` are unchanged.
             - With ``body_frame_origin="start"``, the body origin is at the local start of the rest-sized
               capsule centerline. The COM and shape are at local ``(0, 0, half_height)``, and the other
               centerline endpoint is at ``(0, 0, 2 * half_height)``. These offsets use rest lengths; the
@@ -11178,6 +11215,7 @@ class ModelBuilder:
         result = self._add_rod_object(
             rod,
             cfg=cfg,
+            total_mass=total_mass,
             stretch_stiffness=stretch_stiffness,
             stretch_damping=stretch_damping,
             shear_stiffness=shear_stiffness,
@@ -11193,7 +11231,103 @@ class ModelBuilder:
             body_frame_origin=body_frame_origin,
         )
         self._record_curve_deformable_object(label, (start_body, self.body_count), (start_joint, self.joint_count))
+        if particle_based:
+            self._add_rod_particles(rod, result[0])
         return result
+
+    def _add_rod_particles(self, rod: Rod, bodies: list[int]) -> None:
+        """Add shared centerline particles and record each segment's endpoints."""
+        # Particle rods participate in SolverStyle3D's shared constraint
+        # system. Register its model data schema here so finalize() creates
+        # typed zero-length arrays for constraint types that were not authored.
+        for attribute in (
+            self.CustomAttribute(
+                name="tri_aniso_ke",
+                frequency=Model.AttributeFrequency.TRIANGLE,
+                assignment=Model.AttributeAssignment.MODEL,
+                dtype=wp.vec3,
+                default=wp.vec3(0.0),
+                namespace="style3d",
+                keep_empty=True,
+            ),
+            self.CustomAttribute(
+                name="edge_rest_area",
+                frequency=Model.AttributeFrequency.EDGE,
+                assignment=Model.AttributeAssignment.MODEL,
+                dtype=wp.float32,
+                default=0.0,
+                namespace="style3d",
+                keep_empty=True,
+            ),
+            self.CustomAttribute(
+                name="edge_bending_cot",
+                frequency=Model.AttributeFrequency.EDGE,
+                assignment=Model.AttributeAssignment.MODEL,
+                dtype=wp.vec4,
+                default=wp.vec4(0.0),
+                namespace="style3d",
+                keep_empty=True,
+            ),
+        ):
+            self.add_custom_attribute(attribute)
+        self.add_custom_attribute(
+            self.CustomAttribute(
+                name="rod_particle_indices",
+                frequency=Model.AttributeFrequency.BODY,
+                assignment=Model.AttributeAssignment.MODEL,
+                dtype=wp.vec2i,
+                default=wp.vec2i(-1),
+                references=Model.AttributeFrequency.PARTICLE,
+            )
+        )
+        points, edges, _ = rod._normalize_and_validate_geometry()
+        masses = np.zeros(len(points))
+        for body, (a, b) in zip(bodies, edges, strict=True):
+            masses[a] += self.body_mass[body] / 2.0
+            masses[b] += self.body_mass[body] / 2.0
+        nodes = [
+            self.add_particle(wp.vec3(*point), wp.vec3(0.0), float(mass), radius=0.0, flags=0)
+            for point, mass in zip(points, masses, strict=True)
+        ]
+        for body, (a, b) in zip(bodies, edges, strict=True):
+            self.custom_attributes["rod_particle_indices"].values[body] = wp.vec2i(nodes[a], nodes[b])
+
+    def _update_rod_particle_masses(self) -> None:
+        """Apply rod body mass and pin edits to authored centerline particles."""
+        attribute = self.custom_attributes.get("rod_particle_indices")
+        if attribute is None:
+            return
+        masses: dict[int, float] = {}
+        pinned: set[int] = set()
+        for body, pair in attribute.values.items():
+            for node_value in pair:
+                node = int(node_value)
+                masses[node] = masses.get(node, 0.0) + self.body_mass[body] / 2.0
+                if self.body_mass[body] == 0.0:
+                    pinned.add(node)
+        for node, mass in masses.items():
+            self.particle_mass[node] = 0.0 if node in pinned else mass
+
+    def _set_rod_segment_mass(self, body: int, mass: float) -> None:
+        """Assign mass and cylinder or open-tube inertia to a generated single-capsule rod segment."""
+        inertia = wp.mat33(0.0)
+        if mass > 0.0:
+            shape = self.body_shapes[body][0]
+            scale = self.shape_scale[shape]
+            radius, half_height = float(scale[0]), float(scale[1])
+            inner_radius = 0.0
+            if not self.shape_is_solid[shape]:
+                thickness = _validate_hollow_thickness("capsule", self.shape_margin[shape], (("radius", radius),))
+                inner_radius = radius - thickness
+            # Use assigned mass directly: subtracting shell tensors loses precision for thin walls.
+            radial_sum = radius * radius + inner_radius * inner_radius
+            transverse = mass * (radial_sum / 4.0 + half_height * half_height / 3.0)
+            axial = mass * radial_sum / 2.0
+            inertia = wp.mat33(transverse, 0.0, 0.0, 0.0, transverse, 0.0, 0.0, 0.0, axial)
+        self.body_mass[body] = mass
+        self.body_inv_mass[body] = 1.0 / mass if mass > 0.0 else 0.0
+        self.body_inertia[body] = inertia
+        self.body_inv_inertia[body] = _inverse_inertia(inertia) if mass > 0.0 else wp.mat33(0.0)
 
     def _add_rod_graph(
         self,
@@ -11204,6 +11338,7 @@ class ModelBuilder:
         rest_quaternions: list[Quat] | np.ndarray | None = None,
         radius: float,
         cfg: ShapeConfig | None,
+        total_mass: float | None = None,
         stretch_stiffness: float | None,
         stretch_damping: float | None,
         shear_stiffness: float | None,
@@ -11224,6 +11359,8 @@ class ModelBuilder:
         """Build a rod graph, optionally using an importer-provided articulation root joint."""
         if cfg is None:
             cfg = self.default_shape_cfg
+        if total_mass is not None and (not math.isfinite(total_mass) or total_mass < 0.0):
+            raise ValueError("add_rod: total_mass must be finite and >= 0")
 
         # Stretch defaults to the cable/rod axial stiffness used by VBD examples.
         stretch_stiffness = 1.0e5 if stretch_stiffness is None else stretch_stiffness
@@ -11383,6 +11520,22 @@ class ModelBuilder:
             shape_label = f"{label}_edge_capsule_0" if label else f"shape_{self.shape_count}"
             cfg._validate_site(shape_label)
 
+        # Assigned rod mass replaces the primitive contribution; leave the caller's config intact.
+        segment_cfg = replace(cfg, density=0.0)
+        # Resolve mass per rest length in Python precision, including NumPy scalar inputs.
+        linear_density = (
+            float(total_mass) / sum(edge_len) if total_mass is not None else float(cfg.density) * math.pi * radius**2
+        )
+        if linear_density > 0.0 and not cfg.is_solid:
+            if total_mass is not None and cfg.margin == 0.0:
+                raise ValueError("add_rod: positive total_mass requires positive hollow wall thickness")
+            # Validate the stored float32 radius before adding bodies; zero thickness warns and leaves zero mass.
+            _validate_hollow_thickness("capsule", cfg.margin, (("radius", np.float32(radius)),))
+            if total_mass is None:
+                # Hollow density mass covers the tube wall of thickness ``cfg.margin``.
+                thickness_ratio = float(cfg.margin) / radius
+                linear_density *= thickness_ratio * (2.0 - thickness_ratio)
+
         # Warn after validation but before mutating the builder.
         if body_frame_origin == "start":
             warnings.warn(
@@ -11405,10 +11558,11 @@ class ModelBuilder:
                 xform=capsule_xform,
                 radius=radius,
                 half_height=0.5 * edge_len[e_idx],
-                cfg=cfg,
+                cfg=segment_cfg,
                 label=shape_label,
                 color=rod_color,
             )
+            self._set_rod_segment_mass(body_id, linear_density * edge_len[e_idx])
 
             edge_bodies.append(body_id)
 
@@ -15395,6 +15549,7 @@ class ModelBuilder:
               is restored before returning or propagating an exception.
         """
 
+        self._update_rod_particle_masses()
         validate_inertia = not skip_validation_inertia and not skip_all_validations
         if validate_inertia:
             # Both validation paths consume float32-representable settings.
@@ -16534,6 +16689,14 @@ class ModelBuilder:
             m.tri_color = _to_wp_array(self.tri_color, wp.vec3, requires_grad=False)
             m.tri_opacity = _to_wp_array(self.tri_opacity, wp.float32, requires_grad=False)
 
+            # Style3D particle rods share the position solver with triangle
+            # constraints. Preserve its typed-array contract when the model
+            # contains rods but no triangles.
+            if "rod_particle_indices" in self.custom_attributes and m.tri_areas is None:
+                m.tri_indices = wp.empty((0, 3), dtype=wp.int32, device=device)
+                m.tri_poses = wp.empty(0, dtype=wp.mat22, device=device)
+                m.tri_areas = wp.empty(0, dtype=wp.float32, device=device)
+
             # ---------------------
             # edges
 
@@ -16543,6 +16706,9 @@ class ModelBuilder:
             m.edge_bending_properties = _to_wp_array(
                 self.edge_bending_properties, wp.float32, requires_grad=requires_grad
             )
+            if "rod_particle_indices" in self.custom_attributes and m.edge_indices is None:
+                m.edge_indices = wp.empty((0, 4), dtype=wp.int32, device=device)
+                m.edge_bending_properties = wp.empty((0, 2), dtype=wp.float32, device=device)
             # Build the soft-mesh adjacency from the accumulated bending edges and triangles:
             # keep the builder's edge numbering (it stays aligned with the bending materials) and
             # derive the edge/triangle maps against the final triangles.
@@ -17034,7 +17200,7 @@ class ModelBuilder:
                 # Keep canonical MuJoCo equality attributes shape-stable at zero rows. This lets
                 # callers consume ``model.mujoco.equality_constraint_*`` without branching on
                 # whether the model contains any equality constraints.
-                if count == 0 and freq_key != "mujoco:equality_constraint":
+                if count == 0 and freq_key != "mujoco:equality_constraint" and not custom_attr.keep_empty:
                     continue
 
                 result = custom_attr.build_array(count, device=device, requires_grad=requires_grad)

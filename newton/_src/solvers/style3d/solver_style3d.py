@@ -7,14 +7,16 @@ import warnings
 from dataclasses import dataclass
 from typing import Any
 
+import numpy as np
 import warp as wp
 
 from ...core.types import override
 from ...exceptions import NewtonDeprecationWarning
 from ...sim import Contacts, Control, Model, ModelBuilder, State
 from ..solver import SolverBase
+from . import solve_cable
 from .builder import PDMatrixBuilder, _compute_max_neighbors
-from .collision import Collision
+from .collision import CableCollision, Collision, ContactSystem
 from .kernels import (
     accumulate_dragging_pd_diag_kernel,
     deactivate_zero_mass_particles_kernel,
@@ -152,6 +154,15 @@ class SolverStyle3D(SolverBase):
         enable_mouse_dragging: bool = False
         """Whether to enable the mouse-dragging kernel."""
 
+        cable_fixed_scale: bool = True
+        """Keep the section scale fixed at one."""
+
+        cable_preserve_volume: bool = True
+        """Enable the internal dynamic-section volume penalty."""
+
+        cable_relaxation: float = 0.1
+        """Fixed relaxation applied to each local cable frame and scale update."""
+
     config: Config
     """Live solver options, retained by reference when supplied at construction.
 
@@ -279,14 +290,19 @@ class SolverStyle3D(SolverBase):
             )
 
         super().__init__(model)
+        self.config = config
         if not hasattr(model, "style3d"):
             raise AttributeError(
                 "Style3D custom attributes are missing from the model. "
                 "Call SolverStyle3D.register_custom_attributes() before building the model."
             )
         self.style3d = model.style3d
+        self._cable = solve_cable._CableWorkspace(model, config)
+        cable = self._cable
         # Keep solver-specific activity constraints out of the shared model.
-        self._particle_flags = wp.clone(model.particle_flags)
+        self._particle_flags = (
+            wp.clone(model.particle_flags) if model.particle_count else wp.empty(0, dtype=int, device=self.device)
+        )
         if model.particle_count > 0:
             wp.launch(
                 deactivate_zero_mass_particles_kernel,
@@ -295,9 +311,14 @@ class SolverStyle3D(SolverBase):
                 outputs=[self._particle_flags],
                 device=self.device,
             )
-        self.collision: Collision | None = Collision(model)  # set None to disable
+        cloth_collision = Collision(model) if model.tri_count or model.edge_count else None
+        cable_collision = CableCollision(model, cable) if cable.n else None
+        self.collision: ContactSystem | None = (
+            ContactSystem(model, cloth=cloth_collision, cable=cable_collision)
+            if cloth_collision is not None or cable_collision is not None
+            else None
+        )
         self.linear_solver = PcgSolver(model.particle_count, self.device)
-        self.config = config
 
         # Fixed PD matrix
         self.pd_non_diags = SparseMatrixELL()
@@ -313,7 +334,10 @@ class SolverStyle3D(SolverBase):
         # Static part of A_diag, full A_diag, and inverse of A_diag
         self.static_A_diags = wp.zeros(model.particle_count, dtype=float, device=self.device)
         self.inv_A_diags = wp.zeros(model.particle_count, dtype=wp.mat33, device=self.device)
+        self._step_diagonal = wp.zeros(model.particle_count, dtype=float, device=self.device)
         self.A_diags = wp.zeros(model.particle_count, dtype=wp.mat33, device=self.device)
+        self._base_entries = wp.clone(self.pd_non_diags.nz_ell)
+        cable.bind_position_system(self.pd_non_diags, self.pd_diags, self.static_A_diags, self.rhs, self.dx)
 
         # Drag info
         self.drag_pos = wp.zeros(1, dtype=wp.vec3, device=self.device)
@@ -358,8 +382,19 @@ class SolverStyle3D(SolverBase):
         if self.config.iterations < 1:
             raise ValueError(f"Config.iterations must be at least 1, got {self.config.iterations}.")
 
+        cable = self._cable
+        cable.config = self.config
+
+        if cable.n:
+            if not cable.fixed_scale and self.collision is not None and self.collision.has_cable and contacts is not None:
+                raise ValueError("Dynamic cable radii do not yet support collision contacts.")
+            cable.frame_begin(state_in, dt)
         # Model masses and flags may change between solver steps.
-        wp.copy(self._particle_flags, self.model.particle_flags)
+        wp.copy(
+            self._particle_flags,
+            self.model.particle_flags if self.model.particle_flags is not None else self._particle_flags,
+        )
+
         if self.model.particle_count > 0:
             wp.launch(
                 deactivate_zero_mass_particles_kernel,
@@ -369,8 +404,9 @@ class SolverStyle3D(SolverBase):
                 device=self.device,
             )
 
+        cable.activate_particles(self.model.particle_mass, self._particle_flags)
         if self.collision is not None:
-            self.collision.frame_begin(state_in.particle_q, state_in.particle_qd, dt)
+            self.collision.frame_begin(state_in, contacts, dt)
 
         wp.launch(
             kernel=init_step_kernel,
@@ -410,7 +446,13 @@ class SolverStyle3D(SolverBase):
                 device=self.device,
             )
 
+        wp.copy(self._step_diagonal, self.static_A_diags)
+        if cable.n:
+            wp.copy(cable.predicted, self.x_inertia, count=cable.n)
+
         for _iter in range(self.config.iterations):
+            if cable.n:
+                wp.copy(cable.center, state_in.particle_q, count=cable.n)
             wp.launch(
                 init_rhs_kernel,
                 dim=self.model.particle_count,
@@ -452,6 +494,13 @@ class SolverStyle3D(SolverBase):
                 device=self.device,
             )
 
+            cable.local_step(
+                dt,
+                state_in.particle_q,
+                self._step_diagonal,
+                self._base_entries,
+                contact_energy=None if self.collision is None else self.collision.evaluate_cable_energy,
+            )
             if self.config.enable_mouse_dragging:
                 wp.launch(
                     eval_drag_force_kernel,
@@ -483,7 +532,7 @@ class SolverStyle3D(SolverBase):
                     prepare_jacobi_preconditioner_kernel,
                     dim=self.model.particle_count,
                     inputs=[
-                        self.static_A_diags,
+                        self.collision.preconditioner_diagonal,
                         self.collision.contact_hessian_diagonal(),
                         self._particle_flags,
                     ],
@@ -532,11 +581,13 @@ class SolverStyle3D(SolverBase):
         )
 
         if self.collision is not None:
-            self.collision.frame_end(state_out.particle_q, state_out.particle_qd, dt)
+            self.collision.frame_end(state_out, dt)
+        if cable.n:
+            cable.write_body_state(state_in, state_out, dt)
 
     def rebuild_bvh(self, state: State):
         if self.collision is not None:
-            self.collision.rebuild_bvh(state.particle_q)
+            self.collision.rebuild_bvh(state)
 
     @override
     @classmethod
@@ -554,6 +605,7 @@ class SolverStyle3D(SolverBase):
                 dtype=wp.vec3,
                 default=wp.vec3(0.0),
                 namespace="style3d",
+                keep_empty=True,
             )
         )
         builder.add_custom_attribute(
@@ -564,6 +616,7 @@ class SolverStyle3D(SolverBase):
                 dtype=wp.float32,
                 default=0.0,
                 namespace="style3d",
+                keep_empty=True,
             )
         )
         builder.add_custom_attribute(
@@ -574,6 +627,7 @@ class SolverStyle3D(SolverBase):
                 dtype=wp.vec4,
                 default=wp.vec4(0.0, 0.0, 0.0, 0.0),
                 namespace="style3d",
+                keep_empty=True,
             )
         )
         builder.add_custom_attribute(
@@ -600,27 +654,30 @@ class SolverStyle3D(SolverBase):
                     "Call SolverStyle3D.register_custom_attributes() before building the model."
                 )
 
-            tri_indices = model.tri_indices.numpy()
-            tri_poses = model.tri_poses.numpy().tolist()
-            tri_areas = model.tri_areas.numpy().tolist()
-            edge_indices = model.edge_indices.numpy()
-            edge_bending_properties = model.edge_bending_properties.numpy().tolist()
-            tri_aniso_ke = model.style3d.tri_aniso_ke.numpy().tolist()
-            edge_rest_area = model.style3d.edge_rest_area.numpy().tolist()
-            edge_bending_cot = model.style3d.edge_bending_cot.numpy().tolist()
-
+            tri_indices = model.tri_indices.numpy() if model.tri_count else np.empty((0, 3), dtype=np.int32)
+            tri_poses = model.tri_poses.numpy().tolist() if model.tri_count else []
+            tri_areas = model.tri_areas.numpy().tolist() if model.tri_count else []
+            edge_indices = model.edge_indices.numpy() if model.edge_count else np.empty((0, 4), dtype=np.int32)
+            edge_bending_properties = model.edge_bending_properties.numpy().tolist() if model.edge_count else []
+            tri_aniso_ke = model.style3d.tri_aniso_ke.numpy().tolist() if model.tri_count else []
+            edge_rest_area = model.style3d.edge_rest_area.numpy().tolist() if model.edge_count else []
+            edge_bending_cot = model.style3d.edge_bending_cot.numpy().tolist() if model.edge_count else []
             def assemble(max_neighbors):
                 """Assemble from scratch so failed attempts never contribute partial entries."""
                 matrix = PDMatrixBuilder(model.particle_count, max_neighbor=max_neighbors)
                 matrix.add_stretch_constraints(tri_indices, tri_poses, tri_aniso_ke, tri_areas)
                 matrix.add_bend_constraints(edge_indices, edge_bending_properties, edge_rest_area, edge_bending_cot)
+                self._cable.add_position_constraints(matrix)
                 return matrix
 
             try:
                 pd_matrix_builder = assemble(32)
             except ValueError:
                 # Only overflowing meshes pay for counting stretch and bending connections.
-                max_neighbors = _compute_max_neighbors(model.particle_count, tri_indices, edge_indices)
+                max_neighbors = max(
+                    _compute_max_neighbors(model.particle_count, tri_indices, edge_indices),
+                    self._cable.max_position_neighbors(),
+                )
                 pd_matrix_builder = assemble(max_neighbors)
             self.pd_diags, self.pd_non_diags.num_nz, self.pd_non_diags.nz_ell = pd_matrix_builder.finalize(self.device)
 

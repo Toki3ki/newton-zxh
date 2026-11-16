@@ -123,6 +123,36 @@ def add_stretch_constraints_kernel(
 
 
 @wp.kernel
+def add_scalar_stencils_kernel(
+    indices: wp.array2d[int],
+    coefficients: wp.array2d[float],
+    weights: wp.array[float],
+    neighbors: wp.array2d[int],
+    counts: wp.array[int],
+    values: wp.array2d[float],
+    diagonal: wp.array[float],
+    overflow: wp.array[int],
+):
+    # Serial assembly shares the builder's existing neighbor insertion logic.
+    for e in range(indices.shape[0]):
+        for i in range(indices.shape[1]):
+            row = indices[e, i]
+            for j in range(indices.shape[1]):
+                col = indices[e, j]
+                value = weights[e] * coefficients[e, i] * coefficients[e, j]
+                if value == 0.0:
+                    continue
+                # Repeated node IDs in a bending stencil contribute to the
+                # same diagonal, even when their stencil slots differ.
+                if row == col:
+                    diagonal[row] += value
+                else:
+                    slot = add_connection(row, col, counts, neighbors, overflow)
+                    if slot >= 0:
+                        values[row, slot] += value
+
+
+@wp.kernel
 def assemble_nz_ell_kernel(
     neighbors: wp.array2d[int],
     nz_values: wp.array2d[float],
@@ -178,6 +208,51 @@ class PDMatrixBuilder:
         vertex = int(self._overflow.numpy()[0]) - 1
         if vertex >= 0:
             raise ValueError(f"PD matrix capacity {self.max_neighbors} exceeded at vertex {vertex}.")
+
+    def add_scalar_stencils(self, indices, coefficients, weights, *, active):
+        """Assemble ``E = w/2 ||sum_i a_i x_i - t||²`` into the PD matrix.
+
+        The position Hessian block is ``H_ij = w a_i a_j I3``, so the ELL
+        matrix stores only the scalar ``w a_i a_j``. The target ``t`` appears
+        only in the right-hand side. ``active=0`` removes a pinned position
+        increment from the linear system.
+        """
+        indices = np.asarray(indices, dtype=np.int32)
+        coefficients = np.asarray(coefficients, dtype=float)
+        weights = np.asarray(weights, dtype=float)
+        active = np.asarray(active, dtype=float)
+        if len(indices) == 0:
+            return
+        coefficients = coefficients * active[indices]
+        wp.launch(
+            add_scalar_stencils_kernel,
+            dim=1,
+            inputs=[
+                wp.array2d(indices, dtype=int, device="cpu"),
+                wp.array2d(coefficients, dtype=float, device="cpu"),
+                wp.array(weights, dtype=float, device="cpu"),
+            ],
+            outputs=[self.neighbors, self.counts, self.values, self.diags, self._overflow],
+            device="cpu",
+        )
+        self._check_overflow()
+
+    def add_cable_stretch_constraints(self, edges, lengths, stiffness, *, active):
+        """Add H_ij = k * a_i * a_j * I3 with a = [-1/L, 1/L].
+
+        The material target R*ez contributes to the RHS, not this Hessian.
+        """
+        lengths = np.asarray(lengths, dtype=float)
+        coefficients = np.column_stack((-1.0 / lengths, 1.0 / lengths))
+        self.add_scalar_stencils(edges, coefficients, stiffness, active=active)
+
+    def add_cable_bend_constraints(self, indices, coefficients, stiffness, *, active):
+        """Add the fixed-frame chord Hessian H_ij = kb * a_i * a_j * I3.
+
+        E_b = kb/2 * ||sum_i a_i*c_i - R_a*b0||^2. The rotating rest
+        target affects the position RHS and the local material torque.
+        """
+        self.add_scalar_stencils(indices, coefficients, stiffness, active=active)
 
     def add_stretch_constraints(
         self,
