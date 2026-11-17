@@ -55,6 +55,7 @@ def eval_affine_orthogonality_kernel(
     body_mass: wp.array[float],
     body_inertia: wp.array[wp.mat33],
     body_flags: wp.array[int],
+    affine_bodies: wp.array[int],
     rigidity_ratio: float,
     dt: float,
     # outputs
@@ -80,8 +81,9 @@ def eval_affine_orthogonality_kernel(
     Overwrite constraint-only diagonal blocks and cache each nonlinear
     iteration; the caller combines these blocks with the mass diagonal.
     """
-    body = wp.tid()
-    start = 4 * body
+    affine_row = wp.tid()
+    body = affine_bodies[affine_row]
+    start = 4 * affine_row
     hessian_diag[start] = wp.mat33(0.0)
     if (
         rigidity_ratio <= 0.0
@@ -91,7 +93,7 @@ def eval_affine_orthogonality_kernel(
         hessian_diag[start + 1] = wp.mat33(0.0)
         hessian_diag[start + 2] = wp.mat33(0.0)
         hessian_diag[start + 3] = wp.mat33(0.0)
-        scaled_rotation[body] = wp.mat33(0.0)
+        scaled_rotation[affine_row] = wp.mat33(0.0)
         return
 
     affine = wp.matrix_from_cols(x[start + 1], x[start + 2], x[start + 3])
@@ -103,7 +105,7 @@ def eval_affine_orthogonality_kernel(
     stiffness = affine_rigidity(body_inertia[body], rigidity_ratio, dt)
     force_columns = wp.transpose(-stiffness * normal_residual)
     scaled = wp.sqrt(0.5 * stiffness) * rotation
-    scaled_rotation[body] = scaled
+    scaled_rotation[affine_row] = scaled
     scaled_columns = wp.transpose(scaled)
 
     rhs[start + 1] += force_columns[0]
@@ -153,14 +155,16 @@ def body_to_affine_kernel(
     body_inv_mass: wp.array[float],
     body_inv_inertia: wp.array[wp.mat33],
     body_world: wp.array[int],
+    affine_bodies: wp.array[int],
     gravity: wp.array[wp.vec3],
     dt: float,
     # outputs
     x: wp.array[wp.vec3],
     x_inertia: wp.array[wp.vec3],
 ):
-    body = wp.tid()
-    start = 4 * body
+    affine_row = wp.tid()
+    body = affine_bodies[affine_row]
+    start = 4 * affine_row
     pose = body_q[body]
 
     # Use semi-implicit rigid-body integration to define the inertial target pose.
@@ -204,17 +208,19 @@ def affine_to_body_kernel(
     dt: float,
     body_mass: wp.array[float],
     body_flags: wp.array[int],
+    affine_bodies: wp.array[int],
     # outputs
     body_q: wp.array[wp.transform],
     body_qd: wp.array[wp.spatial_vector],
 ):
-    body = wp.tid()
+    affine_row = wp.tid()
+    body = affine_bodies[affine_row]
 
     # Bodies outside the ABD solve are owned by another solver or caller.
     if body_mass[body] <= 0.0 or (body_flags[body] & BodyFlags.DYNAMIC) == 0:
         return
 
-    start = 4 * body
+    start = 4 * affine_row
     center = x[start]
     linear = v[start]
     affine = wp.matrix_from_cols(x[start + 1], x[start + 2], x[start + 3])
@@ -259,10 +265,13 @@ class AffineBody:
     integrator's normalized Euler quaternion update.
     """
 
-    def __init__(self, model: Model) -> None:
+    def __init__(self, model: Model, affine_bodies: wp.array[int], body_to_affine_row: wp.array[int]) -> None:
         self.model = model
+        self.affine_bodies = affine_bodies
+        self.body_to_affine_row = body_to_affine_row
+        self.body_count = len(affine_bodies)
         # Zero until orthogonality is evaluated; refreshed once per nonlinear iteration.
-        self._orthogonality_scaled_rotation = wp.zeros(model.body_count, dtype=wp.mat33, device=model.device)
+        self._orthogonality_scaled_rotation = wp.zeros(self.body_count, dtype=wp.mat33, device=model.device)
 
     def eval_orthogonality(
         self,
@@ -274,15 +283,25 @@ class AffineBody:
     ) -> None:
         """Accumulate SO(3) forces and overwrite the constraint-only diagonal blocks.
 
-        Pass affine views of length 4 * body_count for x, rhs, and hessian_diag.
+        Pass affine views of length ``4 * self.body_count`` for x, rhs, and hessian_diag.
         Call once per nonlinear iteration before off_diag_multiply, with a
         positive dt and nonnegative rigidity_ratio. The cached tangent remains
         fixed throughout the linear solve. A ratio of zero clears the constraint.
+        ``affine_bodies`` contains only bodies owned by ABD; cable proxy bodies
+        therefore have no rows in these views.
         """
         wp.launch(
             eval_affine_orthogonality_kernel,
-            dim=self.model.body_count,
-            inputs=[x, self.model.body_mass, self.model.body_inertia, self.model.body_flags, rigidity_ratio, dt],
+            dim=self.body_count,
+            inputs=[
+                x,
+                self.model.body_mass,
+                self.model.body_inertia,
+                self.model.body_flags,
+                self.affine_bodies,
+                rigidity_ratio,
+                dt,
+            ],
             outputs=[rhs, hessian_diag, self._orthogonality_scaled_rotation],
             device=self.model.device,
         )
@@ -295,17 +314,23 @@ class AffineBody:
         """
         wp.launch(
             affine_off_diag_multiply_kernel,
-            dim=self.model.body_count,
+            dim=self.body_count,
             inputs=[x, mass_off_diag, self._orthogonality_scaled_rotation],
             outputs=[Ax],
             device=self.model.device,
         )
 
-    def to_internal_state(self, state: State, x: wp.array[wp.vec3], x_inertia: wp.array[wp.vec3], dt: float) -> None:
+    def to_internal_state(
+        self,
+        state: State,
+        x: wp.array[wp.vec3],
+        x_inertia: wp.array[wp.vec3],
+        dt: float,
+    ) -> None:
         """Write current affine coordinates and inertial targets for a positive time step."""
         wp.launch(
             body_to_affine_kernel,
-            dim=self.model.body_count,
+            dim=self.body_count,
             inputs=[
                 state.body_q,
                 state.body_qd,
@@ -315,6 +340,7 @@ class AffineBody:
                 self.model.body_inv_mass,
                 self.model.body_inv_inertia,
                 self.model.body_world,
+                self.affine_bodies,
                 self.model.gravity,
                 dt,
             ],
@@ -322,11 +348,17 @@ class AffineBody:
             device=self.model.device,
         )
 
-    def from_internal_state(self, state_out: State, x: wp.array[wp.vec3], v: wp.array[wp.vec3], dt: float) -> None:
+    def from_internal_state(
+        self,
+        state_out: State,
+        x: wp.array[wp.vec3],
+        v: wp.array[wp.vec3],
+        dt: float,
+    ) -> None:
         """Fit the rigid states for bodies updated by the ABD solve."""
         wp.launch(
             affine_to_body_kernel,
-            dim=self.model.body_count,
+            dim=self.body_count,
             inputs=[
                 x,
                 v,
@@ -335,6 +367,7 @@ class AffineBody:
                 dt,
                 self.model.body_mass,
                 self.model.body_flags,
+                self.affine_bodies,
             ],
             outputs=[state_out.body_q, state_out.body_qd],
             device=self.model.device,

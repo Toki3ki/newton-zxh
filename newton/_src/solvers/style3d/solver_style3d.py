@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from enum import IntFlag
 from typing import Any
 
+import numpy as np
 import warp as wp
 
 from ...core.types import override
@@ -16,6 +17,7 @@ from ...sim import Contacts, Control, Model, ModelBuilder, State
 from ..solver import SolverBase
 from .affine_body import AffineBody
 from .builder import PDMatrixBuilder, _compute_max_neighbors
+from .cable import Cable
 from .collision import Collision
 from .contact import Contact
 from .kernels import (
@@ -59,10 +61,11 @@ def _warn_legacy_attribute(name: str, config_name: str) -> None:
 
 
 class SolverStyle3D(SolverBase):
-    r"""Implicit solver for cloth and free rigid bodies using affine body dynamics.
+    r"""Implicit solver for cloth, free rigid bodies, and VIPER cables.
 
     Select :attr:`Dynamics.DEFORMABLE` (the default), :attr:`Dynamics.AFFINE_BODY`,
-    or :attr:`Dynamics.ALL` to advance cloth, rigid bodies, or both together.
+    :attr:`Dynamics.CABLE`, or :attr:`Dynamics.ALL` to advance cloth, rigid
+    bodies, rod-backed cables, or any combination of them in one shared solve.
     Joint constraints are not supported. See the :doc:`Style3D solver guide
     </solvers/style3d>` for setup, rigidity, and contact parameters.
 
@@ -157,7 +160,10 @@ class SolverStyle3D(SolverBase):
         AFFINE_BODY = 1 << 1
         """Advance rigid bodies using affine body dynamics."""
 
-        ALL = DEFORMABLE | AFFINE_BODY
+        CABLE = 1 << 2
+        """Advance rod-backed deformable objects using VIPER cable dynamics."""
+
+        ALL = DEFORMABLE | AFFINE_BODY | CABLE
         """Enable all supported dynamics."""
 
     @dataclass(kw_only=True)
@@ -166,8 +172,9 @@ class SolverStyle3D(SolverBase):
 
         The solver keeps the supplied object as :attr:`SolverStyle3D.config`.
         Changes made before a subsequent :meth:`SolverStyle3D.step` take
-        effect on that step. Captured CUDA graphs must be recaptured to use
-        updated configuration values.
+        effect on that step, except for the ``cable_*`` rigidities, which are
+        captured when the solver is constructed. Captured CUDA graphs must be
+        recaptured to use updated configuration values.
 
         Example:
             Configure a solver for an existing model::
@@ -195,6 +202,15 @@ class SolverStyle3D(SolverBase):
 
         enable_mouse_dragging: bool = False
         """Whether to enable the mouse-dragging kernel."""
+
+        cable_stretch_stiffness: float = 1.0e4
+        """Axial rigidity ``EA`` [N] of VIPER cables. Zero disables stretch."""
+
+        cable_bend_stiffness: float = 1.0e-2
+        """Bending rigidity ``EI`` [N·m²] of VIPER cables. Zero disables bending."""
+
+        cable_twist_stiffness: float = 1.0e-2
+        """Torsional rigidity ``GJ`` [N·m²] of VIPER cables. Zero disables twist."""
 
     config: Config
     """Live solver options, retained by reference when supplied at construction.
@@ -297,7 +313,9 @@ class SolverStyle3D(SolverBase):
                 Combine flags with bitwise OR (``|``). Defaults to
                 :attr:`Dynamics.DEFORMABLE` for deformable particles, including cloth.
                 Use :attr:`Dynamics.AFFINE_BODY` to advance rigid bodies using affine
-                body dynamics, :attr:`Dynamics.ALL` to select all dynamics,
+                body dynamics, :attr:`Dynamics.CABLE` to advance rod-backed
+                deformable objects using VIPER cable dynamics,
+                :attr:`Dynamics.ALL` to select all dynamics,
                 or :attr:`Dynamics.NONE` to select none.
 
         Raises:
@@ -344,6 +362,7 @@ class SolverStyle3D(SolverBase):
 
         enable_deformable = bool(dynamics & SolverStyle3D.Dynamics.DEFORMABLE)
         enable_affine_body = bool(dynamics & SolverStyle3D.Dynamics.AFFINE_BODY)
+        enable_cable = bool(dynamics & SolverStyle3D.Dynamics.CABLE)
 
         super().__init__(model)
         self._style3d_attr = getattr(model, "style3d", None)
@@ -351,13 +370,65 @@ class SolverStyle3D(SolverBase):
         self.dynamics = dynamics
         self.config = config
 
+        # Cable segment bodies stay model objects for collision, rendering, and
+        # state interchange, but only the cable module advances them.
+        self._cable = (
+            Cable(
+                model,
+                stretch_stiffness=config.cable_stretch_stiffness,
+                bend_stiffness=config.cable_bend_stiffness,
+                twist_stiffness=config.cable_twist_stiffness,
+            )
+            if enable_cable
+            else None
+        )
+        self._cable_body_segment = (
+            self._cable.body_to_segment
+            if self._cable is not None
+            else wp.full(model.body_count, -1, dtype=int, device=self.device)
+        )
+
+        # Cable segment bodies are proxy geometry, not ABD unknowns. Pack only
+        # ordinary Newton bodies into the affine solve range.
+        body_to_segment_np = self._cable_body_segment.numpy()
+        affine_bodies_np = (
+            np.flatnonzero(body_to_segment_np < 0).astype(np.int32)
+            if enable_affine_body
+            else np.zeros(0, dtype=np.int32)
+        )
+        body_to_affine_row_np = np.full(model.body_count, -1, dtype=np.int32)
+        body_to_affine_row_np[affine_bodies_np] = np.arange(affine_bodies_np.size, dtype=np.int32)
+        self._affine_bodies = wp.array(affine_bodies_np, dtype=int, device=self.device)
+        self._body_to_affine_row = wp.array(body_to_affine_row_np, dtype=int, device=self.device)
+
         # Number of DOF blocks in the linear system, with three scalar DOFs per block.
+        # Preserve the established particle/affine layout and append cable rows.
         self._particle_count = model.particle_count if enable_deformable else 0
-        self._affine_body_count = model.body_count if enable_affine_body else 0
-        self._dof_block_count = self._particle_count + self._affine_body_count * 4
-        self._affine_body = AffineBody(model) if enable_affine_body else None
+        self._affine_body_count = len(affine_bodies_np)
+        self._affine_body_end = self._particle_count + 4 * self._affine_body_count
+        self._cable_position_start = self._affine_body_end
+        self._cable_position_end = self._affine_body_end
+        self._cable_rotation_start = self._affine_body_end
+        self._cable_rotation_end = self._affine_body_end
+        self._dof_block_count = self._affine_body_end
+        if self._cable is not None:
+            self._cable_position_end = self._cable_position_start + self._cable.node_count
+            self._cable_rotation_start = self._cable_position_end
+            self._cable_rotation_end = self._cable_rotation_start + self._cable.segment_count
+            self._dof_block_count = self._cable_rotation_end
+        self._affine_body = (
+            AffineBody(model, self._affine_bodies, self._body_to_affine_row) if enable_affine_body else None
+        )
         self._linear_solver = PcgSolver(self._dof_block_count, self.device)
-        self._contact = Contact(model, self._particle_count) if enable_affine_body else None
+        self._contact = (
+            Contact(
+                model,
+                self._particle_count,
+                self._body_to_affine_row,
+            )
+            if enable_affine_body
+            else None
+        )
 
         # ParticleFlags for every particle and affine block, separate from model flags.
         self._particle_flags = wp.zeros(self._dof_block_count, dtype=int, device=self.device)
@@ -385,6 +456,22 @@ class SolverStyle3D(SolverBase):
         self._inv_A_diag = wp.zeros(self._dof_block_count, dtype=wp.mat33, device=self.device)
         # Matrix-free contribution to A x beyond the assembled base matrix.
         self._matrix_free_Ax = wp.zeros(self._dof_block_count, dtype=wp.vec3, device=self.device)
+
+        if self._cable is not None:
+            self._cable.bind_dofs(
+                position_start=self._cable_position_start,
+                position_end=self._cable_position_end,
+                rotation_start=self._cable_rotation_start,
+                rotation_end=self._cable_rotation_end,
+                x=self._x,
+                x_prev=self._x_prev,
+                x_inertia=self._x_inertia,
+                v=self._v,
+                dx=self._dx,
+                A_diag_base=self._A_diag_base,
+                pd_diag=self._pd_diag,
+                solver_flags=self._particle_flags,
+            )
 
         # Drag info
         self._drag_pos = wp.zeros(1, dtype=wp.vec3, device=self.device)
@@ -443,14 +530,12 @@ class SolverStyle3D(SolverBase):
         particle_q = self._x[: self._particle_count]
         particle_qd = self._v[: self._particle_count]
 
-        if self.collision is not None:
-            self.collision.frame_begin(particle_q, particle_qd, dt)
-
         wp.launch(
             kernel=init_step_kernel,
             dim=self._particle_count + self._affine_body_count,
             inputs=[
                 self._particle_count,
+                self._affine_bodies,
                 dt,
                 self.model.gravity,
                 self.model.particle_world,
@@ -468,6 +553,12 @@ class SolverStyle3D(SolverBase):
             outputs=[self._x_inertia, self._A_diag_base, self._dx, self._affine_mass_off_diag],
             device=self.device,
         )
+        # Cable node/frame rows have their own per-step initialization.
+        if self._cable is not None:
+            self._cable.init_step(state_in, dt)
+
+        if self.collision is not None:
+            self.collision.frame_begin(particle_q, particle_qd, dt)
 
         if self._particle_count > 0 and self.config.enable_mouse_dragging:
             wp.launch(
@@ -493,6 +584,7 @@ class SolverStyle3D(SolverBase):
                     self._x,
                     self._x_inertia,
                     self._particle_count,
+                    self._affine_bodies,
                     self.model.particle_mass,
                     self.model.body_mass,
                     self.model.body_inertia,
@@ -501,6 +593,13 @@ class SolverStyle3D(SolverBase):
                 outputs=[self._rhs],
                 device=self.device,
             )
+
+            # Cable node/frame rows have their own inertial right-hand side.
+            if self._cable is not None:
+                self._cable.init_rhs(dt, self._rhs[self._affine_body_end : self._dof_block_count])
+
+            # Dynamic constraint diagonals are rebuilt by the evaluators below.
+            self._A_diag.zero_()
 
             if self._particle_count > 0:
                 wp.launch(
@@ -561,25 +660,40 @@ class SolverStyle3D(SolverBase):
                     include_body_contacts=self._contact is None,
                 )
 
-            self._A_diag[: self._particle_count].zero_()
-            if self._affine_body is not None:
+            if self._affine_body is not None and self._affine_body_count > 0:
                 self._affine_body.eval_orthogonality(
-                    self._x[self._particle_count :],
-                    self._rhs[self._particle_count :],
-                    self._A_diag[self._particle_count :],
+                    self._x[self._particle_count : self._affine_body_end],
+                    self._rhs[self._particle_count : self._affine_body_end],
+                    self._A_diag[self._particle_count : self._affine_body_end],
                     self.config.affine_rigidity_ratio,
                     dt,
+                )
+
+            if self._cable is not None:
+                self._cable.eval_cable_constraints(
+                    dt,
+                    self._rhs[self._affine_body_end : self._dof_block_count],
+                    self._A_diag[self._affine_body_end : self._dof_block_count],
                 )
 
             if self._contact is not None:
                 self._contact.eval_contacts(
                     contacts,
-                    self._x,
-                    self._x_prev,
-                    self._x_inertia,
-                    self._particle_flags,
-                    self._rhs,
-                    self._A_diag,
+                    self._x[: self._affine_body_end],
+                    self._x_prev[: self._affine_body_end],
+                    self._x_inertia[: self._affine_body_end],
+                    self._particle_flags[: self._affine_body_end],
+                    self._rhs[: self._affine_body_end],
+                    self._A_diag[: self._affine_body_end],
+                    dt,
+                )
+
+            if self._cable is not None:
+                self._cable.eval_contacts(
+                    contacts,
+                    state_in.body_q,
+                    self._rhs[self._affine_body_end : self._dof_block_count],
+                    self._A_diag[self._affine_body_end : self._dof_block_count],
                     dt,
                 )
 
@@ -618,16 +732,25 @@ class SolverStyle3D(SolverBase):
                 device=self.device,
             )
 
+            if self._cable is not None:
+                self._cable.apply_increment()
+
+        velocity_end = self._affine_body_end
+        if self._cable is not None:
+            velocity_end += self._cable.node_count
         wp.launch(
             kernel=update_velocity_kernel,
             dim=self._dof_block_count,
-            inputs=[dt, self._particle_count, self._x_prev, self._x],
+            inputs=[dt, self._particle_count, velocity_end, self._x_prev, self._x],
             outputs=[self._v],
             device=self.device,
         )
 
         if self.collision is not None:
             self.collision.frame_end(particle_q, particle_qd, dt)
+
+        if self._cable is not None:
+            self._cable.frame_end(state_out, dt)
 
         self._from_internal_state(state_out, dt)
 
@@ -637,12 +760,16 @@ class SolverStyle3D(SolverBase):
             self.collision.hessian_multiply(x[: self._particle_count], self._matrix_free_Ax[: self._particle_count])
         else:
             self._matrix_free_Ax[: self._particle_count].zero_()
-        if self._affine_body is not None:
+        if self._affine_body is not None and self._affine_body_count > 0:
             self._affine_body.off_diag_multiply(
-                x[self._particle_count :], self._affine_mass_off_diag, self._matrix_free_Ax[self._particle_count :]
+                x[self._particle_count : self._affine_body_end],
+                self._affine_mass_off_diag,
+                self._matrix_free_Ax[self._particle_count : self._affine_body_end],
             )
+        if self._cable is not None:
+            self._cable.matrix_free_multiply(x, self._matrix_free_Ax)
         if self._contact is not None:
-            self._contact.off_diag_multiply(x, self._matrix_free_Ax)
+            self._contact.off_diag_multiply(x[: self._affine_body_end], self._matrix_free_Ax[: self._affine_body_end])
         return self._matrix_free_Ax
 
     def rebuild_bvh(self, state: State):
@@ -727,15 +854,20 @@ class SolverStyle3D(SolverBase):
                 if self._particle_count > 0:
                     matrix.add_stretch_constraints(tri_indices, tri_poses, tri_aniso_ke, tri_areas)
                     matrix.add_bend_constraints(edge_indices, edge_bending_properties, edge_rest_area, edge_bending_cot)
+                if self._cable is not None:
+                    self._cable.add_fixed_matrix(matrix)
                 return matrix
 
             try:
                 pd_matrix_builder = assemble(32)
             except ValueError:
-                # Only overflowing meshes pay for counting stretch and bending connections.
+                # Only overflowing meshes pay for counting the connections they need.
+                max_neighbors = 0
                 if self._particle_count > 0:
                     max_neighbors = _compute_max_neighbors(self._dof_block_count, tri_indices, edge_indices)
-                    pd_matrix_builder = assemble(max_neighbors)
+                if self._cable is not None:
+                    max_neighbors = max(max_neighbors, self._cable.max_matrix_neighbors())
+                pd_matrix_builder = assemble(max(max_neighbors, 1))
             self._pd_diag, self._pd_off_diag.num_nz, self._pd_off_diag.nz_ell = pd_matrix_builder.finalize(self.device)
 
     def _to_internal_state(self, state: State, dt: float):
@@ -749,6 +881,7 @@ class SolverStyle3D(SolverBase):
                 dim=self._particle_count + self._affine_body_count,
                 inputs=[
                     self._particle_count,
+                    self._affine_bodies,
                     self.model.particle_mass,
                     self.model.particle_flags,
                     self.model.body_mass,
@@ -759,7 +892,10 @@ class SolverStyle3D(SolverBase):
             )
         if self._affine_body_count > 0:
             self._affine_body.to_internal_state(
-                state, self._x[self._particle_count :], self._x_inertia[self._particle_count :], dt
+                state,
+                self._x[self._particle_count : self._affine_body_end],
+                self._x_inertia[self._particle_count : self._affine_body_end],
+                dt,
             )
 
     def _from_internal_state(self, state: State, dt: float):
@@ -769,7 +905,10 @@ class SolverStyle3D(SolverBase):
             wp.copy(state.particle_qd, self._v, count=self._particle_count)
         if self._affine_body_count > 0:
             self._affine_body.from_internal_state(
-                state, self._x[self._particle_count :], self._v[self._particle_count :], dt
+                state,
+                self._x[self._particle_count : self._affine_body_end],
+                self._v[self._particle_count : self._affine_body_end],
+                dt,
             )
 
     def _update_drag_info(self, index: int, pos: wp.vec3, bary_coord: wp.vec3):

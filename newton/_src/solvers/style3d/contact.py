@@ -113,6 +113,7 @@ def eval_contact_kernel(
     solver_flags: wp.array[int],
     body_com: wp.array[wp.vec3],
     shape_body: wp.array[int],
+    body_to_affine_row: wp.array[int],
     shape_ke: wp.array[float],
     shape_kd: wp.array[float],
     shape_kf: wp.array[float],
@@ -159,11 +160,16 @@ def eval_contact_kernel(
     b1 = shape_body[s1]
     if b0 == b1:
         return
+    row0 = body_to_affine_row[b0] if b0 >= 0 else -1
+    row1 = body_to_affine_row[b1] if b1 >= 0 else -1
+    # Contacts containing a non-ABD body are owned by its dynamics module.
+    if (b0 >= 0 and row0 < 0) or (b1 >= 0 and row1 < 0):
+        return
 
     w0 = contact_weights(b0, point0[tid], body_com)
     w1 = contact_weights(b1, point1[tid], body_com)
-    p0 = current_contact_point(b0, w0, point0[tid], x, x_inertia, solver_flags)
-    p1 = current_contact_point(b1, w1, point1[tid], x, x_inertia, solver_flags)
+    p0 = current_contact_point(row0, w0, point0[tid], x, x_inertia, solver_flags)
+    p1 = current_contact_point(row1, w1, point1[tid], x, x_inertia, solver_flags)
     n = normal[tid]
     gap = contact_surface_separation(p0, p1, n, margin0[tid], margin1[tid])
     if gap >= 0.0:
@@ -179,8 +185,8 @@ def eval_contact_kernel(
         kd = contact_kd[tid] if contact_kd[tid] > 0.0 else kd
         mu *= contact_mu[tid] if contact_mu[tid] > 0.0 else 1.0
 
-    previous0 = contact_point(b0, w0, point0[tid], x_prev)
-    previous1 = contact_point(b1, w1, point1[tid], x_prev)
+    previous0 = contact_point(row0, w0, point0[tid], x_prev)
+    previous1 = contact_point(row1, w1, point1[tid], x_prev)
     surface = wp.vec3(0.0)
     if surface_velocity:
         surface = surface_velocity[tid]
@@ -189,10 +195,10 @@ def eval_contact_kernel(
     anchor1 = point1[tid] + offset1[tid]
     t0 = contact_weights(b0, anchor0, body_com)
     t1 = contact_weights(b1, anchor1, body_com)
-    current0 = current_contact_point(b0, t0, anchor0, x, x_inertia, solver_flags)
-    current1 = current_contact_point(b1, t1, anchor1, x, x_inertia, solver_flags)
-    previous0 = contact_point(b0, t0, anchor0, x_prev)
-    previous1 = contact_point(b1, t1, anchor1, x_prev)
+    current0 = current_contact_point(row0, t0, anchor0, x, x_inertia, solver_flags)
+    current1 = current_contact_point(row1, t1, anchor1, x, x_inertia, solver_flags)
+    previous0 = contact_point(row0, t0, anchor0, x_prev)
+    previous1 = contact_point(row1, t1, anchor1, x_prev)
     velocity = ((current1 - previous1) - (current0 - previous0)) / dt + surface
     vt = velocity - wp.dot(n, velocity) * n
     gn, Hn, gt, Ht = contact_response(gap, n, vn, vt, ke, kd, kf, mu, dt)
@@ -207,15 +213,16 @@ def eval_contact_kernel(
             weights = w1
             friction_weights = t1
             sign = -1.0
-        if body >= 0:
+        affine_row = body_to_affine_row[body] if body >= 0 else -1
+        if affine_row >= 0:
             for i in range(4):
-                row = 4 * body + i
+                row = 4 * affine_row + i
                 wp.atomic_add(rhs, row, sign * (weights[i] * gn + friction_weights[i] * gt))
                 wp.atomic_add(diag, row, weights[i] * weights[i] * Hn + friction_weights[i] * friction_weights[i] * Ht)
 
     tangent.active = 1
-    tangent.body0 = b0
-    tangent.body1 = b1
+    tangent.body0 = row0
+    tangent.body1 = row1
     tangent.weights0 = w0
     tangent.weights1 = w1
     tangent.friction_weights0 = t0
@@ -272,6 +279,7 @@ def eval_soft_contact_kernel(
     body_com: wp.array[wp.vec3],
     particle_radius: wp.array[float],
     shape_body: wp.array[int],
+    body_to_affine_row: wp.array[int],
     shape_margin: wp.array[float],
     shape_mu: wp.array[float],
     ke: float,
@@ -308,10 +316,11 @@ def eval_soft_contact_kernel(
     if particle < 0 or particle >= particle_count or shape < 0:
         return
     body = shape_body[shape]
+    affine_row = body_to_affine_row[body] if body >= 0 else -1
     point = contact_body_pos[tid]
     weights = contact_weights(body, point, body_com)
-    current = current_contact_point(body, weights, point, affine_x, affine_inertia, affine_flags)
-    previous = contact_point(body, weights, point, affine_prev)
+    current = current_contact_point(affine_row, weights, point, affine_x, affine_inertia, affine_flags)
+    previous = contact_point(affine_row, weights, point, affine_prev)
     n = contact_normal[tid]
     gap = wp.dot(n, x[particle] - current) - particle_radius[particle] - shape_margin[shape]
     if gap >= 0.0:
@@ -320,8 +329,8 @@ def eval_soft_contact_kernel(
     # Mesh surface velocity is body-local and excludes rigid-body motion.
     # Freeze this prescribed velocity in the contact tangent for this iteration.
     surface = contact_body_vel[tid]
-    if body >= 0:
-        start = 4 * body
+    if affine_row >= 0:
+        start = 4 * affine_row
         if (affine_flags[start] & ParticleFlags.ACTIVE) != 0:
             surface = (
                 surface[0] * affine_x[start + 1] + surface[1] * affine_x[start + 2] + surface[2] * affine_x[start + 3]
@@ -350,15 +359,15 @@ def eval_soft_contact_kernel(
     hessian = Hn + Ht
     wp.atomic_sub(rhs, particle, gradient)
     wp.atomic_add(diag, particle, hessian)
-    if body >= 0:
+    if affine_row >= 0:
         for i in range(4):
-            row = particle_count + 4 * body + i
+            row = particle_count + 4 * affine_row + i
             wp.atomic_add(rhs, row, weights[i] * gradient)
             wp.atomic_add(diag, row, weights[i] * weights[i] * hessian)
 
     tangent.active = 1
     tangent.particle = particle
-    tangent.body = body
+    tangent.body = affine_row
     tangent.weights = weights
     tangent.hessian = hessian
     tangents[tid] = tangent
@@ -394,9 +403,15 @@ class Contact:
     inertial targets. Particle-only solves retain the cloth collision path.
     """
 
-    def __init__(self, model: Model, particle_count: int) -> None:
+    def __init__(
+        self,
+        model: Model,
+        particle_count: int,
+        body_to_affine_row: wp.array[int],
+    ) -> None:
         self.model = model
         self.particle_count = particle_count
+        self._body_to_affine_row = body_to_affine_row
         self._tangents = wp.zeros(model.rigid_contact_max or 0, dtype=ContactTangent, device=model.device)
         self._soft_tangents = wp.zeros(0, dtype=SoftContactTangent, device=model.device)
 
@@ -431,6 +446,7 @@ class Contact:
                 solver_flags[offset:],
                 self.model.body_com,
                 self.model.shape_body,
+                self._body_to_affine_row,
                 self.model.shape_material_ke,
                 self.model.shape_material_kd,
                 self.model.shape_material_kf,
@@ -473,6 +489,7 @@ class Contact:
                     self.model.body_com,
                     self.model.particle_radius,
                     self.model.shape_body,
+                    self._body_to_affine_row,
                     self.model.shape_margin,
                     self.model.shape_material_mu,
                     self.model.soft_contact_ke,
