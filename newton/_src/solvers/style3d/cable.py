@@ -538,7 +538,7 @@ class Cable:
             device=self.model.device,
         )
 
-    def frame_end(self, state_out: State, dt: float) -> None:
+    def _from_internal_state(self, state_out: State, dt: float) -> None:
         """Reconstruct the proxy segment bodies from the solved cable state.
 
         Args:

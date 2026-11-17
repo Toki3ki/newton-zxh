@@ -710,6 +710,11 @@ class SolverStyle3D(SolverBase):
                 device=self.device,
             )
 
+            # Solve A delta_x = rhs, where
+            # delta_x = [delta_particle,
+            #            delta_ABD,
+            #            delta_cable_node,
+            #            delta_cable_rotation]^T.
             self._linear_solver.solve(
                 self._pd_off_diag,
                 self._A_diag,
@@ -733,6 +738,10 @@ class SolverStyle3D(SolverBase):
             )
 
             if self._cable is not None:
+                # The rotation rows store the tangent accumulated during this
+                # time step: θ <- θ + Δθ. Reconstruct each
+                # material frame from the step-begin frame as
+                # R<-Exp(θ)R_begin
                 self._cable.apply_increment()
 
         velocity_end = self._affine_body_end
@@ -750,7 +759,7 @@ class SolverStyle3D(SolverBase):
             self.collision.frame_end(particle_q, particle_qd, dt)
 
         if self._cable is not None:
-            self._cable.frame_end(state_out, dt)
+            self._cable._from_internal_state(state_out, dt)
 
         self._from_internal_state(state_out, dt)
 
