@@ -212,6 +212,15 @@ class SolverStyle3D(SolverBase):
         cable_twist_stiffness: float = 1.0e-2
         """Torsional rigidity ``GJ`` [N·m²] of VIPER cables. Zero disables twist."""
 
+        cable_bend_yield_strain: float = 0.0
+        """Cable bend yield strain [rad]. Zero keeps bending elastic."""
+
+        cable_twist_yield_strain: float = 0.0
+        """Cable twist yield strain [rad]. Zero keeps twist elastic."""
+
+        cable_max_rotation_increment: float = 0.0
+        """Maximum Cable frame update per nonlinear iteration [rad]. Zero disables limiting."""
+
     config: Config
     """Live solver options, retained by reference when supplied at construction.
 
@@ -378,6 +387,8 @@ class SolverStyle3D(SolverBase):
                 stretch_stiffness=config.cable_stretch_stiffness,
                 bend_stiffness=config.cable_bend_stiffness,
                 twist_stiffness=config.cable_twist_stiffness,
+                bend_yield_strain=config.cable_bend_yield_strain,
+                twist_yield_strain=config.cable_twist_yield_strain,
             )
             if enable_cable
             else None
@@ -729,6 +740,10 @@ class SolverStyle3D(SolverBase):
             if self.collision is not None:
                 self.collision.linear_iteration_end(self._dx[: self._particle_count])
 
+            if self._cable is not None:
+                # The frozen tangent is local; keep Δθ within its SO(3) trust region.
+                self._cable.stabilize_increment(self.config.cable_max_rotation_increment)
+
             wp.launch(
                 nonlinear_step_kernel,
                 dim=self._dof_block_count,
@@ -759,6 +774,8 @@ class SolverStyle3D(SolverBase):
             self.collision.frame_end(particle_q, particle_qd, dt)
 
         if self._cable is not None:
+            # Local return mapping updates plastic reference strain once after convergence.
+            self._cable.update_plastic_strain()
             self._cable._from_internal_state(state_out, dt)
 
         self._from_internal_state(state_out, dt)

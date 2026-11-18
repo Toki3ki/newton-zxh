@@ -591,17 +591,21 @@ def cable_node_begin_kernel(
     """Predict VIPER center positions for the whole cable solve."""
     tid = wp.tid()
     node_previous[tid] = node_position[tid]
-    dx[tid] = wp.vec3(0.0)
     mass = node_mass[tid]
     if mass <= 0.0:
         node_velocity[tid] = wp.vec3(0.0)
         node_inertia[tid] = node_position[tid]
+        dx[tid] = wp.vec3(0.0)
         A_diag_base[tid] = 0.0
         solver_flags[tid] = 0
         return
     solver_flags[tid] = ParticleFlags.ACTIVE
     A_diag_base[tid] = pd_diag[tid] + mass / (dt * dt)
     node_inertia[tid] = node_position[tid] + node_velocity[tid] * dt + gravity[node_world[tid]] * (dt * dt)
+    # Warm-start the first PCG solve with the unconstrained inertial motion.
+    # A uniform translation lies in the null space of the elastic rod energies,
+    # so gravity should not need to propagate along a stiff cable through PCG.
+    dx[tid] = node_inertia[tid] - node_position[tid]
 
 
 @wp.func
@@ -765,28 +769,39 @@ def cable_stretch_matrix_free_kernel(
 @wp.kernel
 def cable_eval_darboux_kernel(
     pairs: wp.array2d[int],
-    rest: wp.array[wp.vec3],
+    rest_rotation: wp.array[wp.quat],
+    plastic_strain: wp.array[wp.vec3],
     weights: wp.array[wp.vec3],
     frame: wp.array[wp.mat33],
     rhs: wp.array[wp.vec3],
     diagonal: wp.array[wp.mat33],
     off_diagonal: wp.array[wp.mat33],
 ):
-    """Linearize VIPER's dimensionless Darboux strain 2 Im(conj(q0) q1).
+    r"""Linearize VIPER's elastic Darboux strain for fixed local plasticity.
 
-    The dual length is absorbed into weights = (EI, EI, GJ) / Ldual.
-    Both frames use world-space left increments. Their Jacobians are opposite,
+    The relative error is ``q_err = inverse(q_rest) * conj(q0) * q1`` and the
+    residual is ``e = 2 Im(q_err) - plastic_strain``. The
+    site energy is ``E = 1/2 e^T diag(weights) e``. With plastic strain fixed,
+    this contributes ``b = -J^T K e`` and the PSD Gauss-Newton block
+    ``A = J^T K J`` to the global solve.
+
+    The dual length is absorbed into weights = (EI, EI, GJ) / Ldual. Both
+    frames use world-space left increments. Their Jacobians are opposite,
     preserving rigid rotation invariance and a symmetric PSD frozen operator.
     """
     i = wp.tid()
     a = pairs[i, 0]
     b = pairs[i, 1]
-    q = wp.normalize(wp.quat_from_matrix(wp.transpose(frame[a]) * frame[b]))
+    q_relative = wp.normalize(wp.quat_from_matrix(wp.transpose(frame[a]) * frame[b]))
+    q_rest = rest_rotation[i]
+    q = wp.normalize(wp.quat_inverse(q_rest) * q_relative)
     if q[3] < 0.0:
         q = -q
     v = wp.vec3(q[0], q[1], q[2])
-    residual = 2.0 * v - rest[i]
-    jac = (q[3] * wp.identity(3, float) - wp.skew(v)) * wp.transpose(frame[a])
+    # Plastic curvature is a local reference shift; it stays fixed during the
+    # global solve, so the elastic energy remains quadratic in this residual.
+    residual = 2.0 * v - plastic_strain[i]
+    jac = (q[3] * wp.identity(3, float) - wp.skew(v)) * wp.transpose(wp.quat_to_matrix(q_rest)) * wp.transpose(frame[a])
     weighted = wp.diag(weights[i])
     force = wp.transpose(jac) * (weighted * residual)
     block = wp.transpose(jac) * weighted * jac
@@ -795,6 +810,57 @@ def cable_eval_darboux_kernel(
     wp.atomic_add(diagonal, a, block)
     wp.atomic_add(diagonal, b, block)
     off_diagonal[i] = -block
+
+
+# Plastic return mapping is local: the global solve sees only a fixed plastic
+# reference strain, while this kernel updates that reference after convergence.
+@wp.kernel
+def cable_update_plastic_strain_kernel(
+    pairs: wp.array2d[int],
+    rest_rotation: wp.array[wp.quat],
+    frame: wp.array[wp.mat33],
+    plastic_strain: wp.array[wp.vec3],
+    bend_yield: float,
+    twist_yield: float,
+):
+    r"""Apply perfect-plastic return mapping to one converged Darboux site.
+
+    The trial elastic strain and moment are::
+
+        e_trial = kappa - kappa_rest - kappa_p
+        m_trial = K e_trial
+
+    Bend uses a circular yield surface in its two material-plane components.
+    If ``||e_b|| > bend_yield``, radial return adds
+    ``(1 - bend_yield/||e_b||) e_b`` to plastic bend. Twist uses an independent
+    one-dimensional yield interval and adds the excess signed strain to
+    ``kappa_p``. Equivalently, each update projects elastic strain onto its
+    yield surface, capping bend/twist moment at ``K * yield_strain``.
+
+    The caller runs this once after the global nonlinear solve, never inside
+    PCG or a nonlinear iteration.
+    """
+    i = wp.tid()
+    a = pairs[i, 0]
+    b = pairs[i, 1]
+    q_relative = wp.normalize(wp.quat_from_matrix(wp.transpose(frame[a]) * frame[b]))
+    q = wp.normalize(wp.quat_inverse(rest_rotation[i]) * q_relative)
+    if q[3] < 0.0:
+        q = -q
+    elastic = 2.0 * wp.vec3(q[0], q[1], q[2]) - plastic_strain[i]
+    updated = plastic_strain[i]
+
+    bend_norm = wp.sqrt(elastic[0] * elastic[0] + elastic[1] * elastic[1])
+    if bend_yield > 0.0 and bend_norm > bend_yield:
+        scale = 1.0 - bend_yield / bend_norm
+        updated = updated + wp.vec3(scale * elastic[0], scale * elastic[1], 0.0)
+
+    if twist_yield > 0.0 and wp.abs(elastic[2]) > twist_yield:
+        excess = wp.abs(elastic[2]) - twist_yield
+        sign = 1.0 if elastic[2] > 0.0 else -1.0
+        updated = updated + wp.vec3(0.0, 0.0, sign * excess)
+
+    plastic_strain[i] = updated
 
 
 @wp.kernel
@@ -823,6 +889,29 @@ def cable_apply_increment_kernel(
     """Retract the accumulated tangent increment onto the material frames."""
     e = wp.tid()
     frame[e] = cable_rotation_exp(tangent[e]) * frame_begin[e]
+
+
+@wp.kernel
+def cable_measure_increment_scale_kernel(
+    max_angle: float,
+    rotation_increment: wp.array[wp.vec3],
+    scale: wp.array[float],
+):
+    r"""Find ``alpha=min(1, theta_max/max_e|Delta theta_e|)`` for this step."""
+    e = wp.tid()
+    angle = wp.length(rotation_increment[e])
+    if angle > max_angle:
+        wp.atomic_min(scale, 0, max_angle / angle)
+
+
+@wp.kernel
+def cable_scale_increment_kernel(
+    scale: wp.array[float],
+    increment: wp.array[wp.vec3],
+):
+    r"""Apply ``Delta x_cable <- alpha Delta x_cable`` to coupled increments."""
+    i = wp.tid()
+    increment[i] = scale[0] * increment[i]
 
 
 @wp.kernel
@@ -878,6 +967,8 @@ def cable_eval_contact_kernel(
     shape_body: wp.array[int],
     shape_ke: wp.array[float],
     shape_kd: wp.array[float],
+    shape_kf: wp.array[float],
+    shape_mu: wp.array[float],
     contact_count: wp.array[int],
     shape0: wp.array[int],
     shape1: wp.array[int],
@@ -888,12 +979,22 @@ def cable_eval_contact_kernel(
     margin1: wp.array[float],
     contact_ke: wp.array[float],
     contact_kd: wp.array[float],
+    contact_mu: wp.array[float],
+    surface_velocity: wp.array[wp.vec3],
     # outputs
     rhs: wp.array[wp.vec3],
     diag: wp.array[wp.mat33],
     tangents: wp.array[CableContactTangent],
 ):
-    """Map capsule contacts to two rod-node rows and one frame row per Cable side."""
+    r"""Map normal and friction responses onto each Cable contact Jacobian.
+
+    The relative velocity is split into ``vn = dot(n, vrel)`` and
+    ``vt = vrel - vn*n``. :func:`contact_response` applies the regularized
+    Coulomb law ``|ft| = min(kf*|vt|, mu*|fn|)``. Normal and friction use the
+    same contact-point Jacobian in this history-free model, so their gradients
+    and PSD tangents are combined before being mapped to the two node rows and
+    material-frame row of each Cable side.
+    """
     tid = wp.tid()
     tangent = CableContactTangent()
     tangent.row0 = -1
@@ -947,13 +1048,22 @@ def cable_eval_contact_kernel(
         return
     ke = wp.max(0.0, 0.5 * (shape_ke[s0] + shape_ke[s1]))
     kd = wp.max(0.0, 0.5 * (shape_kd[s0] + shape_kd[s1]))
+    kf = wp.max(0.0, 0.5 * (shape_kf[s0] + shape_kf[s1]))
+    mu = wp.sqrt(wp.max(0.0, shape_mu[s0] * shape_mu[s1]))
     if contact_ke:
         ke = contact_ke[tid] if contact_ke[tid] > 0.0 else ke
         kd = contact_kd[tid] if contact_kd[tid] > 0.0 else kd
-    vn = wp.dot(n, ((p1 - previous1) - (p0 - previous0)) / dt)
-    gradient, hessian, _friction_gradient, _friction_hessian = contact_response(
-        gap, n, vn, wp.vec3(0.0), ke, kd, 0.0, 0.0, dt
+        mu *= contact_mu[tid] if contact_mu[tid] > 0.0 else 1.0
+    velocity = ((p1 - previous1) - (p0 - previous0)) / dt
+    if surface_velocity:
+        velocity += surface_velocity[tid]
+    vn = wp.dot(n, velocity)
+    vt = velocity - vn * n
+    normal_gradient, normal_hessian, friction_gradient, friction_hessian = contact_response(
+        gap, n, vn, vt, ke, kd, kf, mu, dt
     )
+    gradient = normal_gradient + friction_gradient
+    hessian = normal_hessian + friction_hessian
     half_identity = 0.5 * wp.identity(3, float)
 
     if e0 >= 0:

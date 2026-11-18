@@ -37,10 +37,13 @@ from .kernels import (
     cable_apply_increment_kernel,
     cable_average_state_kernel,
     cable_collect_state_kernel,
+    cable_measure_increment_scale_kernel,
+    cable_scale_increment_kernel,
     cable_contact_matrix_free_kernel,
     cable_darboux_matrix_free_kernel,
     cable_eval_contact_kernel,
     cable_eval_darboux_kernel,
+    cable_update_plastic_strain_kernel,
     cable_eval_stretch_kernel,
     cable_node_begin_kernel,
     cable_node_inertia_kernel,
@@ -94,6 +97,8 @@ class Cable:
         stretch_stiffness: Axial rigidity ``EA`` [N]. Zero disables stretch.
         bend_stiffness: Bending rigidity ``EI`` [N·m²]. Zero disables bending.
         twist_stiffness: Torsional rigidity ``GJ`` [N·m²]. Zero disables twist.
+        bend_yield_strain: Maximum elastic bend strain [rad]. Zero disables bend plasticity.
+        twist_yield_strain: Maximum elastic twist strain [rad]. Zero disables twist plasticity.
 
     Raises:
         ValueError: If a curve is not a chain of single-capsule segments with at
@@ -112,8 +117,14 @@ class Cable:
         stretch_stiffness: float = 1.0e4,
         bend_stiffness: float = 1.0e-2,
         twist_stiffness: float = 1.0e-2,
+        bend_yield_strain: float = 0.0,
+        twist_yield_strain: float = 0.0,
     ) -> None:
         self.model = model
+        # Local plastic reference strain; zero yield thresholds retain elasticity.
+        self._bend_yield_strain = float(bend_yield_strain)
+        self._twist_yield_strain = float(twist_yield_strain)
+        self._increment_scale = wp.ones(1, dtype=float, device=model.device)
         self._allocate_topology(stretch_stiffness, bend_stiffness, twist_stiffness)
 
     @property
@@ -309,7 +320,6 @@ class Cable:
             ],
             device=self.model.device,
         )
-
     def init_rhs(self, dt: float, rhs: wp.array[wp.vec3]) -> None:
         """Initialize the Cable node/frame inertial right-hand side.
 
@@ -375,6 +385,19 @@ class Cable:
         diagonal into the supplied Cable-only rows; the remaining coupling
         blocks are applied by :meth:`matrix_free_multiply`.
 
+        If plasticity is enabled, ``plastic_strain`` stays fixed during the
+        global solve. The elastic residual and energy are
+
+        .. math::
+
+            e_D=\kappa-\kappa_0-\kappa_p, \qquad
+            E_D=\tfrac12 e_D^T K e_D, \qquad
+            b=-J^T K e_D, \quad A=J^T KJ.
+
+        The diagonal blocks are accumulated directly and adjacent-frame
+        off-diagonal blocks are applied matrix-free. After the global solve
+        converges, a local return mapping updates ``plastic_strain`` once.
+
         Args:
             dt: Time step [s]. Reserved for future state-dependent
                 volume-invariant terms; the current fixed-scale energy is
@@ -409,12 +432,30 @@ class Cable:
                 inputs=[
                     self._darboux_segments,
                     self._darboux_rest,
+                    self._darboux_plastic_strain,
                     self._darboux_weights,
                     self._frame,
                 ],
                 outputs=[tangent_rhs, tangent_diag, self._darboux_off_diagonal],
                 device=self.model.device,
             )
+    def update_plastic_strain(self) -> None:
+        """Return the converged elastic bend/twist strain to its yield surface."""
+        if self._darboux_site_count == 0:
+            return
+        wp.launch(
+            cable_update_plastic_strain_kernel,
+            dim=self._darboux_site_count,
+            inputs=[
+                self._darboux_segments,
+                self._darboux_rest,
+                self._frame,
+                self._darboux_plastic_strain,
+                self._bend_yield_strain,
+                self._twist_yield_strain,
+            ],
+            device=self.model.device,
+        )
 
     def eval_contacts(
         self,
@@ -435,7 +476,8 @@ class Cable:
             \delta p = \tfrac12\delta x_a+\tfrac12\delta x_b-[Rr]_\times\delta\theta.
 
         Thus each Cable side writes two rod-node rows and one material-frame
-        row. Contacts without a Cable side are ignored here.
+        row. Normal contact and history-free Coulomb-limited viscous friction
+        are both included. Contacts without a Cable side are ignored here.
         """
         if contacts is None:
             self._contact_tangents.zero_()
@@ -461,6 +503,8 @@ class Cable:
                 self.model.shape_body,
                 self.model.shape_material_ke,
                 self.model.shape_material_kd,
+                self.model.shape_material_kf,
+                self.model.shape_material_mu,
                 contacts.rigid_contact_count,
                 contacts.rigid_contact_shape0,
                 contacts.rigid_contact_shape1,
@@ -471,6 +515,8 @@ class Cable:
                 contacts.rigid_contact_margin1,
                 contacts.rigid_contact_stiffness,
                 contacts.rigid_contact_damping,
+                contacts.rigid_contact_friction,
+                contacts.rigid_contact_surface_velocity,
             ],
             outputs=[rhs, A_diag, self._contact_tangents],
             device=self.model.device,
@@ -535,6 +581,33 @@ class Cable:
             dim=self._segment_count,
             inputs=[self._frame_begin, self._tangent],
             outputs=[self._frame],
+            device=self.model.device,
+        )
+
+    def stabilize_increment(self, max_rotation: float) -> None:
+        """Scale coupled node/frame updates into the local SO(3) trust region."""
+        if self._segment_count == 0 or max_rotation <= 0.0:
+            return
+        self._increment_scale.fill_(1.0)
+        wp.launch(
+            cable_measure_increment_scale_kernel,
+            dim=self._segment_count,
+            inputs=[max_rotation, self._tangent_dx],
+            outputs=[self._increment_scale],
+            device=self.model.device,
+        )
+        wp.launch(
+            cable_scale_increment_kernel,
+            dim=self._node_count,
+            inputs=[self._increment_scale],
+            outputs=[self._node_dx],
+            device=self.model.device,
+        )
+        wp.launch(
+            cable_scale_increment_kernel,
+            dim=self._segment_count,
+            inputs=[self._increment_scale],
+            outputs=[self._tangent_dx],
             device=self.model.device,
         )
 
@@ -620,6 +693,8 @@ class Cable:
             device=self.model.device,
         )
         self._frame_begin.assign(self._frame)
+        # Reset also clears accumulated plastic deformation.
+        self._darboux_plastic_strain.zero_()
 
     ####################################################################################################################
     ################################################    Construction    ################################################
@@ -660,8 +735,11 @@ class Cable:
             return
 
         geometry = self._segment_geometry()
-        self._segment_nodes_np, self._component_offsets = self._build_nodes(geometry["endpoints"])
+        self._segment_nodes_np, self._component_offsets, self._rod_joint_for_pair = self._build_nodes(
+            geometry["endpoints"]
+        )
         self._node_count = int(self._segment_nodes_np.max()) + 1
+        self._node_degree_np = np.bincount(self._segment_nodes_np.ravel(), minlength=self._node_count).astype(np.int32)
         nodes = self._node_state(geometry)
         self._build_elastic_data(
             nodes["position"],
@@ -706,7 +784,9 @@ class Cable:
         device = self.model.device
         self._node_count = 0
         self._segment_nodes_np = np.zeros((0, 2), dtype=np.int32)
+        self._node_degree_np = np.zeros(0, dtype=np.int32)
         self._darboux_segments_np = np.zeros((0, 2), dtype=np.int32)
+        self._rod_joint_for_pair = {}
         self._segment_bodies_np = np.zeros(0, dtype=np.int32)
         self._stretch_stiffness_np = np.zeros(0, dtype=np.float32)
         self._component_offsets = ()
@@ -730,6 +810,10 @@ class Cable:
         self._node_velocity_sum = wp.zeros(0, dtype=wp.vec3, device=device)
         self._node_multiple = wp.zeros(0, dtype=int, device=device)
         self._darboux_segments = wp.zeros((0, 2), dtype=int, device=device)
+        self._darboux_rest = wp.zeros(0, dtype=wp.quat, device=device)
+        self._darboux_weights = wp.zeros(0, dtype=wp.vec3, device=device)
+        self._darboux_off_diagonal = wp.zeros(0, dtype=wp.mat33, device=device)
+        self._darboux_plastic_strain = wp.zeros(0, dtype=wp.vec3, device=device)
 
     def _collect_segments(self) -> list[int]:
         """Return the segment body indices of every deformable curve, in order."""
@@ -869,7 +953,9 @@ class Cable:
 
         return {"position": position, "velocity": velocity, "mass": mass, "world": world}
 
-    def _build_nodes(self, endpoints: np.ndarray) -> tuple[np.ndarray, tuple[range, ...]]:
+    def _build_nodes(
+        self, endpoints: np.ndarray
+    ) -> tuple[np.ndarray, tuple[range, ...], dict[tuple[int, int], tuple[int, int, int]]]:
         """Weld segment endpoints through declared rod joints to form VIPER nodes.
 
         Welding uses only the declared :attr:`~newton.JointType.ROD` joints of each
@@ -885,7 +971,7 @@ class Cable:
             connected component.
 
         Raises:
-            ValueError: If a rod joint leaves its curve, or if a node is a branch.
+            ValueError: If a rod joint leaves its curve.
         """
         model = self.model
         segment_count = self._segment_count
@@ -905,6 +991,7 @@ class Cable:
                 parent[max(root_a, root_b)] = min(root_a, root_b)
 
         body_to_segment = {int(body): segment for segment, body in enumerate(self._segment_bodies_np)}
+        rod_joint_for_pair: dict[tuple[int, int], tuple[int, int, int]] = {}
         if model.curve_joint_start is not None:
             joint_start = model.curve_joint_start.numpy()
             joint_end = model.curve_joint_end.numpy()
@@ -924,6 +1011,11 @@ class Cable:
                         )
                     parent_segment = body_to_segment[parent_body]
                     child_segment = body_to_segment[child_body]
+                    rod_joint_for_pair[(min(parent_segment, child_segment), max(parent_segment, child_segment))] = (
+                        joint,
+                        parent_segment,
+                        child_segment,
+                    )
                     distances = [
                         (
                             float(np.linalg.norm(endpoints[parent_segment, side] - endpoints[child_segment, other])),
@@ -958,14 +1050,7 @@ class Cable:
                     segment_nodes[segment, side] = node_of_root[root]
             component_offsets.append(range(first_node, next_node))
 
-        multiplicity = np.bincount(segment_nodes.ravel(), minlength=next_node)
-        if np.any(multiplicity > 2):
-            branch = int(np.argmax(multiplicity))
-            raise ValueError(
-                f"Cable: node {branch} is shared by {int(multiplicity[branch])} segment endpoints. "
-                "Branching rod topology is not supported; author an ordered chain instead."
-            )
-        return segment_nodes, tuple(component_offsets)
+        return segment_nodes, tuple(component_offsets), rod_joint_for_pair
 
     def _build_elastic_data(
         self,
@@ -977,17 +1062,23 @@ class Cable:
     ) -> None:
         """Build dimensionless rest Darboux vectors and EI/L, GJ/L weights."""
         device = self.model.device
-        incident: list[list[int]] = [[] for _ in range(self._node_count)]
-        for segment, (start, end) in enumerate(self._segment_nodes_np):
-            incident[int(start)].append(segment)
-            incident[int(end)].append(segment)
-
+        # Each Builder ROD joint contributes one parent-child Darboux site. This
+        # gives an N-way junction exactly N-1 angular constraints (the Builder's
+        # star/spanning-tree edges), rather than either dropping its bend/twist
+        # stiffness or inventing all N(N-1)/2 pairwise constraints.
         darboux_sites: list[tuple[int, int, int]] = []
-        for node, segments in enumerate(incident):
-            if len(segments) != 2 or segments[0] == segments[1]:
-                continue
-            segment0, segment1 = segments
-            darboux_sites.append((segment0, segment1, node))
+        for _pair, (joint, parent_segment, child_segment) in sorted(
+            self._rod_joint_for_pair.items(), key=lambda item: item[1][0]
+        ):
+            parent_nodes = self._segment_nodes_np[parent_segment]
+            child_nodes = self._segment_nodes_np[child_segment]
+            shared = np.intersect1d(parent_nodes, child_nodes)
+            if shared.size != 1:
+                raise ValueError(
+                    f"Cable: ROD joint {joint} must connect two segments at exactly one shared node; "
+                    f"segments {parent_segment} and {child_segment} share {shared.size}."
+                )
+            darboux_sites.append((parent_segment, child_segment, int(shared[0])))
         darboux_segments = np.zeros((len(darboux_sites), 2), dtype=np.int32)
         for site, (segment0, segment1, _node) in enumerate(darboux_sites):
             darboux_segments[site] = (segment0, segment1)
@@ -995,20 +1086,31 @@ class Cable:
         self._darboux_segments_np = darboux_segments
         self._darboux_segments = wp.array2d(darboux_segments, dtype=int, device=device)
 
-        darboux_rest = np.zeros((len(darboux_sites), 3), dtype=np.float32)
-        darboux_weights = np.zeros_like(darboux_rest)
+        darboux_rest = np.zeros((len(darboux_sites), 4), dtype=np.float32)
+        darboux_weights = np.zeros((len(darboux_sites), 3), dtype=np.float32)
         for site, (segment0, segment1, _node) in enumerate(darboux_sites):
-            relative = frames[segment0].T @ frames[segment1]
-            q = np.array(wp.quat_from_matrix(wp.mat33(*relative.ravel())), dtype=np.float64)
+            # The Cable frame is the world rotation of each capsule's material
+            # frame.  Build the reference relative rotation from those frames,
+            # rather than using the joint anchor quaternion directly: a ROD
+            # joint may contain endpoint reversal/anchor rotations that are
+            # already represented by the segment frame convention here.
+            q = np.array(
+                wp.quat_from_matrix(wp.mat33(frames[segment0].T @ frames[segment1])),
+                dtype=np.float64,
+            )
             q /= np.linalg.norm(q)
             if q[3] < 0.0:
                 q = -q
-            darboux_rest[site] = 2.0 * q[:3]
+            darboux_rest[site] = q
             dual_length = 0.5 * (rest_length[segment0] + rest_length[segment1])
             darboux_weights[site] = np.maximum([bend_stiffness, bend_stiffness, twist_stiffness], 0.0) / dual_length
-        self._darboux_rest = wp.array(darboux_rest, dtype=wp.vec3, device=device)
+        self._darboux_rest = wp.array(darboux_rest, dtype=wp.quat, device=device)
         self._darboux_weights = wp.array(darboux_weights, dtype=wp.vec3, device=device)
         self._darboux_off_diagonal = wp.zeros(len(darboux_sites), dtype=wp.mat33, device=device)
+
+        # Local plastic reference strain per Darboux site: [bend_u, bend_v, twist].
+        # Global iterations hold it fixed; return mapping updates it after convergence.
+        self._darboux_plastic_strain = wp.zeros(len(darboux_sites), dtype=wp.vec3, device=device)
 
     def _far_node(self, segment: int, node: int) -> int:
         """Return the segment endpoint that is not ``node``."""
