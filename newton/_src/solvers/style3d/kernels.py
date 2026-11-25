@@ -180,6 +180,8 @@ def eval_tet_constraint_kernel(
     tet_poses: wp.array[wp.mat33],
     tet_materials: wp.array2d[float],
     volume_targets: wp.array[wp.mat33],
+    plastic_rest_stretch: wp.array[wp.mat33],
+    yield_strains: wp.array[float],
     # outputs
     forces: wp.array[wp.vec3],
 ):
@@ -187,12 +189,16 @@ def eval_tet_constraint_kernel(
     tid = wp.tid()
     inv_dm = tet_poses[tid]
     F = tet_deformation_gradient(pos, tet_indices, tet_poses, tid)
-    rotation = proper_rotation(F)
+    if yield_strains.shape[0] > 0 and yield_strains[tid] > 0.0:
+        rest_stretch = plastic_rest_stretch[tid]
+        shape_target = proper_rotation(F * wp.transpose(rest_stretch)) * rest_stretch
+    else:
+        shape_target = proper_rotation(F)
 
     volume = 1.0 / (6.0 * wp.determinant(inv_dm))
     mu = tet_materials[tid, 0]
     lam = tet_materials[tid, 1]
-    stress = (2.0 * mu * volume) * (F - rotation)
+    stress = (2.0 * mu * volume) * (F - shape_target)
     target = project_tet_volume(F, volume_targets[tid])
     volume_targets[tid] = target
     stress += (3.0 * lam * volume) * (F - target)
@@ -200,6 +206,43 @@ def eval_tet_constraint_kernel(
     for i in range(4):
         gradient = -(inv_dm[0] + inv_dm[1] + inv_dm[2]) if i == 0 else inv_dm[i - 1]
         wp.atomic_add(forces, tet_indices[tid, i], -(stress * gradient))
+
+
+@wp.kernel
+def update_tet_plastic_rest_kernel(
+    pos: wp.array[wp.vec3],
+    tet_indices: wp.array2d[wp.int32],
+    tet_poses: wp.array[wp.mat33],
+    yield_strains: wp.array[float],
+    previous_stretch: wp.array[wp.mat33],
+    plastic_rest_stretch: wp.array[wp.mat33],
+):
+    """Accumulate yielded isochoric stretch in each tetrahedron's material frame."""
+    tid = wp.tid()
+    yield_strain = yield_strains[tid]
+    previous = previous_stretch[tid]
+    plastic_rest_stretch[tid] = previous
+    if yield_strain <= 0.0:
+        return
+    F = tet_deformation_gradient(pos, tet_indices, tet_poses, tid)
+    if wp.determinant(F) <= 0.0:
+        return
+    _u, s, V = wp.svd3(F)
+    if wp.min(s) <= 1.0e-6 * wp.max(1.0, wp.max(s)):
+        return
+    logs = wp.vec3(wp.log(s[0]), wp.log(s[1]), wp.log(s[2]))
+    logs -= wp.vec3((logs[0] + logs[1] + logs[2]) / 3.0)
+    axes, p = wp.eig3(previous)
+    log_previous = axes * wp.diag(wp.vec3(wp.log(p[0]), wp.log(p[1]), wp.log(p[2]))) * wp.transpose(axes)
+    delta = V * wp.diag(logs) * wp.transpose(V) - log_previous
+    equivalent = wp.sqrt((2.0 / 3.0) * wp.ddot(delta, delta))
+    if equivalent <= yield_strain:
+        return
+    axes_new, logs_new = wp.eig3(log_previous + (1.0 - yield_strain / equivalent) * delta)
+    mean = (logs_new[0] + logs_new[1] + logs_new[2]) / 3.0
+    for i in range(3):
+        logs_new[i] = wp.exp(logs_new[i] - mean)
+    plastic_rest_stretch[tid] = axes_new * wp.diag(logs_new) * wp.transpose(axes_new)
 
 
 @wp.kernel

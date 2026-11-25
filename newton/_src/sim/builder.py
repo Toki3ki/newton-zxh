@@ -5093,6 +5093,7 @@ class ModelBuilder:
         label: str | None,
         particle_range: tuple[int, int],
         tet_range: tuple[int, int],
+        custom_attributes: dict[str, Any] | None = None,
     ) -> None:
         """Register a volume as an addressable, world-tagged deformable object."""
         label = label or f"volume_{len(self.volume_label)}"
@@ -5102,6 +5103,12 @@ class ModelBuilder:
         self._volume_particle_end.append(particle_range[1])
         self._volume_tet_start.append(tet_range[0])
         self._volume_tet_end.append(tet_range[1])
+        if custom_attributes:
+            self._process_custom_attributes(
+                entity_index=len(self.volume_label) - 1,
+                custom_attrs=custom_attributes,
+                expected_frequency=Model.AttributeFrequency.VOLUME,
+            )
 
     # region importers
     def add_urdf(
@@ -13364,6 +13371,7 @@ class ModelBuilder:
         color: Vec3 | list[Vec3] | np.ndarray | None = None,
         opacity: float | list[float] | np.ndarray | None = None,
         label: str | None = None,
+        custom_attributes: dict[str, Any] | None = None,
     ) -> None:
         """Helper to create a rectangular tetrahedral FEM grid
 
@@ -13406,6 +13414,7 @@ class ModelBuilder:
                 If scalar, applied to all triangles. If array-like, values are
                 applied per triangle.
             label: Optional name appended to :attr:`volume_label` for this soft body.
+            custom_attributes: Registered volume attributes for this soft body.
                 If None, a generated ``volume_N`` label is used. Currently unused by mesh-quality diagnostics
                 because the generated grid is degenerate-free by construction. See
                 :ref:`deformable-objects`.
@@ -13515,7 +13524,9 @@ class ModelBuilder:
             if end_tri > start_tri:
                 self._add_soft_mesh_edges_from_triangles(start_tri, end_tri, edge_ke=edge_ke, edge_kd=edge_kd)
 
-        self._record_volume_deformable_object(label, (start_vertex, len(self.particle_q)), (start_tet, self.tet_count))
+        self._record_volume_deformable_object(
+            label, (start_vertex, len(self.particle_q)), (start_tet, self.tet_count), custom_attributes
+        )
 
     def add_soft_mesh(
         self,
@@ -13544,6 +13555,7 @@ class ModelBuilder:
         opacity: float | list[float] | np.ndarray | None = None,
         validate_mesh: bool = False,
         label: str | None = None,
+        custom_attributes: dict[str, Any] | None = None,
     ) -> None:
         """Helper to create a tetrahedral model from an input tetrahedral mesh.
 
@@ -13553,6 +13565,7 @@ class ModelBuilder:
 
         Args:
             pos: The position of the solid in world space.
+            custom_attributes: Registered volume attributes for this soft body.
             rot: The orientation of the solid in world space.
             scale: Uniform scale applied to vertex positions.
             vel: The velocity of the solid in world space.
@@ -13749,7 +13762,9 @@ class ModelBuilder:
             if end_tri > start_tri:
                 self._add_soft_mesh_edges_from_triangles(start_tri, end_tri, edge_ke=edge_ke, edge_kd=edge_kd)
 
-        self._record_volume_deformable_object(label, (start_vertex, len(self.particle_q)), (start_tet, self.tet_count))
+        self._record_volume_deformable_object(
+            label, (start_vertex, len(self.particle_q)), (start_tet, self.tet_count), custom_attributes
+        )
 
     # incrementally updates rigid body mass with additional mass and inertia expressed at a local to the body
     def _update_body_mass(self, i: int, m: float, inertia: Mat33, p: Vec3, q: Quat):

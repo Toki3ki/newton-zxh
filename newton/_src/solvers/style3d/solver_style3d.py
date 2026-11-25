@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from enum import IntFlag
 from typing import Any
 
+import numpy as np
 import warp as wp
 
 from ...core.types import override
@@ -31,6 +32,7 @@ from .kernels import (
     nonlinear_step_kernel,
     prepare_jacobi_preconditioner_kernel,
     reset_tet_volume_targets_kernel,
+    update_tet_plastic_rest_kernel,
     update_velocity_kernel,
 )
 from .linear_solver import PcgSolver, SparseMatrixELL
@@ -528,6 +530,19 @@ class SolverStyle3D(SolverBase):
             dtype=wp.mat33,
             device=model.device,
         )
+        # Expand the authored material once; the inner solve uses the original scalar PD matrix.
+        thresholds = np.empty(0, dtype=np.float32)
+        if enable_deformable and model.volume_count and hasattr(self._style3d_attr, "volume_yield_strain"):
+            values = self._style3d_attr.volume_yield_strain.numpy()
+            if not np.all(np.isfinite(values)) or np.any(values < 0.0):
+                raise ValueError("Style3D volume yield strains must be finite and nonnegative.")
+            if np.any(values > 0.0):
+                thresholds = np.zeros(model.tet_count, dtype=np.float32)
+                for start, end, value in zip(
+                    model.volume_tet_start.numpy(), model.volume_tet_end.numpy(), values, strict=True
+                ):
+                    thresholds[start:end] = value
+        self._tet_yield_strain = wp.array(thresholds, dtype=float, device=model.device)
         # Number of DOF blocks in the linear system, with three scalar DOFs per block.
         self._particle_count = model.particle_count if enable_deformable else 0
         self._affine_body_count = model.body_count if enable_affine_body else 0
@@ -579,9 +594,10 @@ class SolverStyle3D(SolverBase):
 
         Restore particle positions and velocities in ``state`` before calling
         this method; it leaves those arrays unchanged. Selected volume targets
-        return to identity, matching a new solver rather than restoring the
-        history of an arbitrary saved frame. Other step buffers are refreshed
-        by the next :meth:`step`. Storage is updated in place for CUDA graphs.
+        return to identity, matching a new solver
+        rather than restoring the history of an arbitrary saved frame. Other
+        step buffers are refreshed by the next :meth:`step`. Storage is updated
+        in place for CUDA graphs.
 
         Args:
             state: Restored simulation state. Its arrays are not modified.
@@ -712,6 +728,7 @@ class SolverStyle3D(SolverBase):
                 device=self.device,
             )
 
+        plastic_rest_stretch = state_in.style3d.tet_plastic_rest_stretch if len(self._tet_yield_strain) else None
         for _iter in range(self.config.iterations):
             wp.launch(
                 init_rhs_kernel,
@@ -768,6 +785,8 @@ class SolverStyle3D(SolverBase):
                         self.model.tet_poses,
                         self.model.tet_materials,
                         self._tet_volume_targets,
+                        plastic_rest_stretch,
+                        self._tet_yield_strain,
                     ],
                     outputs=[self._rhs],
                     device=self.device,
@@ -868,6 +887,21 @@ class SolverStyle3D(SolverBase):
             device=self.device,
         )
 
+        if len(self._tet_yield_strain):
+            wp.launch(
+                update_tet_plastic_rest_kernel,
+                dim=self.model.tet_count,
+                inputs=[
+                    particle_q,
+                    self.model.tet_indices,
+                    self.model.tet_poses,
+                    self._tet_yield_strain,
+                    state_in.style3d.tet_plastic_rest_stretch,
+                ],
+                outputs=[state_out.style3d.tet_plastic_rest_stretch],
+                device=self.device,
+            )
+
         if self.collision is not None:
             self.collision.frame_end(particle_q, particle_qd, dt)
 
@@ -899,6 +933,26 @@ class SolverStyle3D(SolverBase):
         See Also:
             :ref:`custom_attributes` for the custom attribute system overview.
         """
+        builder.add_custom_attribute(
+            ModelBuilder.CustomAttribute(
+                name="volume_yield_strain",
+                frequency=AttributeFrequency.VOLUME,
+                assignment=AttributeAssignment.MODEL,
+                dtype=wp.float32,
+                default=0.0,
+                namespace="style3d",
+            )
+        )
+        builder.add_custom_attribute(
+            ModelBuilder.CustomAttribute(
+                name="tet_plastic_rest_stretch",
+                frequency=AttributeFrequency.TETRAHEDRON,
+                assignment=AttributeAssignment.STATE,
+                dtype=wp.mat33,
+                default=wp.mat33(np.eye(3)),
+                namespace="style3d",
+            )
+        )
         builder.add_custom_attribute(
             ModelBuilder.CustomAttribute(
                 name="tri_aniso_ke",
