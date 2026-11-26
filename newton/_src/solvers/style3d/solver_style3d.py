@@ -21,12 +21,14 @@ from .builder import PDMatrixBuilder, _compute_max_neighbors
 from .collision import Collision
 from .contact import Contact
 from .kernels import (
+    accept_friction_correction,
     accumulate_dragging_pd_diag_kernel,
     compute_solver_flags_kernel,
     eval_bend_kernel,
     eval_drag_force_kernel,
     eval_stretch_kernel,
     eval_tet_constraint_kernel,
+    form_friction_correction_candidate,
     init_rhs_kernel,
     init_step_kernel,
     nonlinear_step_kernel,
@@ -85,10 +87,11 @@ class SolverStyle3D(SolverBase):
 
     With affine body dynamics enabled, rigid-rigid and particle-rigid contacts
     use a normal penalty, closing-only damping, and Coulomb-limited viscous friction.
-    The contact tangent holds the normal load and friction gain fixed to remain symmetric
-    positive semidefinite and resist slip reversal overshoot. Contact candidates
-    and normals come from the supplied :class:`~newton.Contacts` and remain
-    fixed during each step.
+    The PCG matrix holds the normal load and friction gain fixed to remain symmetric
+    positive semidefinite and resist slip reversal overshoot. For sliding rigid contacts,
+    a residual correction accounts for the change in friction due to the normal load.
+    Contact candidates and normals come from the supplied :class:`~newton.Contacts`
+    and remain fixed during each step.
 
     :attr:`Dynamics.ALL` couples particles and affine bodies in one linear
     system. Particle-rigid contacts use :attr:`Model.soft_contact_ke`,
@@ -202,8 +205,9 @@ class SolverStyle3D(SolverBase):
         """Number of non-linear iterations per step. Must be at least 1."""
 
         linear_iterations: int = 10
-        """Number of PCG iterations per non-linear iteration, capped by PCG capacity (999 by default).
+        """Number of iterations per PCG solve, capped by PCG capacity (999 by default).
 
+        A nonlinear iteration can use a second PCG solve to correct sliding rigid contact.
         With :attr:`Dynamics.ALL`, coupled particle-rigid contacts may need more than
         the default 10 iterations. Increase this count until the contact response converges;
         insufficient PCG convergence can cause artificial momentum gain during impacts.
@@ -472,13 +476,13 @@ class SolverStyle3D(SolverBase):
                 :attr:`Dynamics.DEFORMABLE` for deformable particles, including cloth.
                 Use :attr:`Dynamics.AFFINE_BODY` to advance rigid bodies using affine
                 body dynamics, :attr:`Dynamics.ALL` to select all dynamics,
-                or :attr:`Dynamics.NONE` to select none.
+                or :attr:`Dynamics.NONE` to select none. A selected range can be empty.
 
         Raises:
             TypeError: If ``config`` is not a :class:`Config` or ``None``, or if
                 a configuration is combined with legacy keyword options.
-            AttributeError: If ``dynamics`` is :attr:`Dynamics.DEFORMABLE` and the
-                model is missing Style3D custom attributes.
+            AttributeError: If deformable dynamics are selected for a model with
+                particles and the model is missing Style3D custom attributes.
             ValueError: If ``dynamics`` contains unsupported flags.
         """
 
@@ -508,20 +512,15 @@ class SolverStyle3D(SolverBase):
                 stacklevel=2,
             )
 
-        if dynamics == SolverStyle3D.Dynamics.DEFORMABLE and not hasattr(model, "style3d"):
-            raise AttributeError(
-                "Style3D custom attributes are missing from the model. "
-                "Call SolverStyle3D.register_custom_attributes() before building the model."
-            )
-        elif int(dynamics) & ~int(SolverStyle3D.Dynamics.ALL):
+        if int(dynamics) & ~int(SolverStyle3D.Dynamics.ALL):
             raise ValueError(f"Unsupported dynamics flags: {dynamics!r}.")
 
         enable_deformable = bool(dynamics & SolverStyle3D.Dynamics.DEFORMABLE)
         enable_affine_body = bool(dynamics & SolverStyle3D.Dynamics.AFFINE_BODY)
 
         super().__init__(model)
+        self._raise_if_kinematic_particles()
         self._style3d_attr = getattr(model, "style3d", None)
-        self.collision = Collision(model) if enable_deformable else None  # set None to disable
         self._dynamics = dynamics
         self.config = config
         self._tet_volume_targets = wp.full(
@@ -547,9 +546,11 @@ class SolverStyle3D(SolverBase):
         self._particle_count = model.particle_count if enable_deformable else 0
         self._affine_body_count = model.body_count if enable_affine_body else 0
         self._dof_block_count = self._particle_count + self._affine_body_count * 4
-        self._affine_body = AffineBody(model) if enable_affine_body else None
+        # The affine contact law also applies to world-attached shapes in a body-free model.
+        self._contact = Contact(model, self._particle_count) if enable_affine_body and self._dof_block_count else None
+        self._affine_body = AffineBody(model) if self._affine_body_count else None
         self._linear_solver = PcgSolver(self._dof_block_count, self.device)
-        self._contact = Contact(model, self._particle_count) if enable_affine_body else None
+        self.collision = Collision(model) if self._particle_count else None
 
         # ParticleFlags for every particle and affine block, separate from model flags.
         self._particle_flags = wp.zeros(self._dof_block_count, dtype=int, device=self.device)
@@ -577,6 +578,11 @@ class SolverStyle3D(SolverBase):
         self._inv_A_diag = wp.zeros(self._dof_block_count, dtype=wp.mat33, device=self.device)
         # Matrix-free contribution to A x beyond the assembled base matrix.
         self._matrix_free_Ax = wp.zeros(self._dof_block_count, dtype=wp.vec3, device=self.device)
+
+        if self._affine_body_count:
+            self._friction_correction_rhs = wp.empty_like(self._rhs)
+            self._friction_correction_candidate = wp.empty_like(self._dx)
+            self._friction_residual_norms_sq = wp.empty(2, dtype=float, device=self.device)
 
         # Drag info
         self._drag_pos = wp.zeros(1, dtype=wp.vec3, device=self.device)
@@ -641,8 +647,9 @@ class SolverStyle3D(SolverBase):
 
         The solver performs non-linear projective dynamics iterations in internal
         buffers with optional collision handling. Final positions and velocities
-        for the selected dynamics are written to ``state_out``. With affine body
-        dynamics enabled, kinematic body poses and velocities are copied unchanged
+        for the selected dynamics are written to ``state_out``. If no selected
+        particles or bodies are present, the step leaves ``state_out`` untouched.
+        With affine body dynamics enabled, kinematic body poses and velocities are copied unchanged
         from ``state_in``, including zero-mass kinematic bodies. Other zero-mass
         body outputs and bodies outside the selected dynamics remain caller-owned.
 
@@ -673,10 +680,10 @@ class SolverStyle3D(SolverBase):
         self.validate_observables(observables, contacts)
         self._require_unreduced_contacts(contacts)
 
-        if self.dynamics == SolverStyle3D.Dynamics.NONE:
-            return
-        elif self.config.iterations < 1:
+        if self.config.iterations < 1:
             raise ValueError(f"Config.iterations must be at least 1, got {self.config.iterations}.")
+        if self._dof_block_count == 0:
+            return
 
         if self._affine_body is not None:
             ratio = self.config.affine_rigidity_ratio
@@ -684,8 +691,8 @@ class SolverStyle3D(SolverBase):
                 raise ValueError(f"Config.affine_rigidity_ratio must be finite and nonnegative, got {ratio}.")
 
         self._to_internal_state(state_in, dt)
-        particle_q = self._x[: self._particle_count]
-        particle_qd = self._v[: self._particle_count]
+        particle_q = self._x[: self._particle_count] if self._particle_count else None
+        particle_qd = self._v[: self._particle_count] if self._particle_count else None
 
         if self.collision is not None:
             self.collision.frame_begin(particle_q, particle_qd, dt)
@@ -698,8 +705,8 @@ class SolverStyle3D(SolverBase):
                 dt,
                 self.model.gravity,
                 self.model.particle_world,
-                state_in.particle_f if self._particle_count > 0 else self._x[:0],
-                particle_qd,
+                state_in.particle_f,
+                self._v,
                 self._x,
                 self._x_prev,
                 self._pd_diag,
@@ -729,6 +736,21 @@ class SolverStyle3D(SolverBase):
             )
 
         plastic_rest_stretch = state_in.style3d.tet_plastic_rest_stretch if len(self._tet_yield_strain) else None
+        correct_rigid_friction = (
+            self._affine_body_count > 0
+            and contacts is not None
+            and contacts.rigid_contact_max > 0
+            and self.config.linear_iterations > 0
+        )
+        primary_dot = wp.utils.array_inner
+        conditional_correction = True
+        if correct_rigid_friction and self.device.is_cuda and self.device.stream.is_capturing:
+            if self.device.stream in self.device.captures:
+                conditional_correction = wp.is_conditional_graph_supported()
+            else:
+                # Warp cannot insert a conditional or manage reduction scratch in a foreign capture.
+                conditional_correction = False
+                primary_dot = self._linear_solver.dot
         for _iter in range(self.config.iterations):
             wp.launch(
                 init_rhs_kernel,
@@ -822,7 +844,8 @@ class SolverStyle3D(SolverBase):
                     include_body_contacts=self._contact is None,
                 )
 
-            self._A_diag[: self._particle_count].zero_()
+            if self._particle_count:
+                self._A_diag[: self._particle_count].zero_()
             if self._affine_body is not None:
                 self._affine_body.eval_orthogonality(
                     self._x[self._particle_count :],
@@ -850,7 +873,7 @@ class SolverStyle3D(SolverBase):
                 inputs=[
                     self._particle_count,
                     self._A_diag_base,
-                    self.collision.contact_hessian_diagonal() if self.collision is not None else self._A_diag[:0],
+                    self.collision.contact_hessian_diagonal() if self.collision is not None else None,
                     self._particle_flags,
                 ],
                 outputs=[self._A_diag, self._inv_A_diag],
@@ -866,7 +889,14 @@ class SolverStyle3D(SolverBase):
                 self._dx,
                 self.config.linear_iterations,
                 self._matrix_free_multiply,
+                dot=primary_dot,
             )
+
+            if correct_rigid_friction:
+                if conditional_correction:
+                    wp.capture_if(self._contact.has_friction_coupling, on_true=self._solve_friction_correction)
+                else:
+                    self._solve_friction_correction()
 
             if self.collision is not None:
                 self.collision.linear_iteration_end(self._dx[: self._particle_count])
@@ -907,11 +937,54 @@ class SolverStyle3D(SolverBase):
 
         self._from_internal_state(state_in, state_out, dt)
 
+    def _solve_friction_correction(self) -> None:
+        """Apply one defect correction using the symmetric PCG operator."""
+        linear_solver = self._linear_solver
+        norms_sq = self._friction_residual_norms_sq
+        candidate = self._friction_correction_candidate
+        self._eval_friction_residual(self._dx, norms_sq[:1])
+        self._friction_correction_rhs.assign(linear_solver.r)
+        linear_solver.solve(
+            self._pd_off_diag,
+            self._A_diag,
+            None,
+            self._friction_correction_rhs,
+            self._inv_A_diag,
+            candidate,
+            self.config.linear_iterations,
+            self._matrix_free_multiply,
+            dot=linear_solver.dot,
+        )
+        wp.launch(
+            form_friction_correction_candidate,
+            dim=self._dof_block_count,
+            inputs=[self._dx, candidate],
+            device=self.device,
+        )
+        self._eval_friction_residual(candidate, norms_sq[1:])
+        wp.launch(
+            accept_friction_correction,
+            dim=self._dof_block_count,
+            inputs=[self._contact.has_friction_coupling, norms_sq, candidate],
+            outputs=[self._dx],
+            device=self.device,
+        )
+
+    def _eval_friction_residual(self, dx: wp.array[wp.vec3], norm_sq: wp.array[float]) -> None:
+        """Evaluate b - (A + C) dx and its preconditioned squared norm."""
+        product = self._matrix_free_multiply(dx)
+        self._contact.friction_load_multiply(dx, product)
+        linear_solver = self._linear_solver
+        linear_solver.step1_update_r(self._pd_off_diag, self._A_diag, self._rhs, dx, product)
+        # The preconditioner scales different coordinate blocks and masks prescribed rows.
+        linear_solver.step2_update_z(self._inv_A_diag)
+        linear_solver.dot(linear_solver.r, linear_solver.z, norm_sq)
+
     def _matrix_free_multiply(self, x: wp.array[wp.vec3]) -> wp.array[wp.vec3]:
         """Return the matrix-free contribution to A x, excluding the assembled base matrix."""
         if self.collision is not None:
             self.collision.hessian_multiply(x[: self._particle_count], self._matrix_free_Ax[: self._particle_count])
-        else:
+        elif self._particle_count:
             self._matrix_free_Ax[: self._particle_count].zero_()
         if self._affine_body is not None:
             self._affine_body.off_diag_multiply(

@@ -4,8 +4,9 @@
 import warp as wp
 
 from ...geometry import ParticleFlags
-from ...sim import Contacts, Model
+from ...sim import Contacts, Model, ShapeFrictionMode
 from ...sim.contacts import contact_surface_separation
+from ..solver import contact_friction_mode
 
 
 @wp.struct
@@ -21,6 +22,8 @@ class ContactTangent:
     friction_weights1: wp.vec4
     normal_hessian: wp.mat33
     friction_hessian: wp.mat33
+    normal: wp.vec3
+    friction_load_derivative: wp.vec3
 
 
 @wp.struct
@@ -45,8 +48,8 @@ def contact_response(
     kf: float,
     mu: float,
     dt: float,
-) -> tuple[wp.vec3, wp.mat33, wp.vec3, wp.mat33]:
-    """Return normal/friction gradients and PSD tangents for a penetrating contact."""
+) -> tuple[wp.vec3, wp.mat33, wp.vec3, wp.mat33, wp.vec3]:
+    """Return contact gradients, PSD tangents, and the friction gradient's gap derivative."""
     normal_gradient = ke * gap + kd * wp.min(vn, 0.0)
     normal_stiffness = ke
     if vn < 0.0:
@@ -57,18 +60,21 @@ def contact_response(
     limit = mu * (-normal_gradient)
     gt = wp.vec3(0.0)
     Ht = wp.mat33(0.0)
+    friction_load_derivative = wp.vec3(0.0)
     if limit > 0.0 and kf > 0.0:
         projector = wp.identity(3, float) - wp.outer(n, n)
         if kf * speed <= limit:
             gt = kf * vt
             Ht = (kf / dt) * projector
         else:
-            gt = limit * (vt / speed)
+            direction = vt / speed
+            gt = limit * direction
             # Freeze the secant gain, retaining stiffness along the slip direction.
             # The exact sliding Hessian has zero curvature there: an unrestricted
             # Newton step can reverse slip, repeatedly overshoot, and inject energy.
             Ht = (limit / (dt * speed)) * projector
-    return gn, Hn, gt, Ht
+            friction_load_derivative = (-mu * normal_stiffness) * direction
+    return gn, Hn, gt, Ht, friction_load_derivative
 
 
 @wp.func
@@ -117,6 +123,7 @@ def eval_contact_kernel(
     shape_kd: wp.array[float],
     shape_kf: wp.array[float],
     shape_mu: wp.array[float],
+    shape_friction_mode: wp.array[wp.int32],
     contact_count: wp.array[int],
     shape0: wp.array[int],
     shape1: wp.array[int],
@@ -136,6 +143,7 @@ def eval_contact_kernel(
     rhs: wp.array[wp.vec3],
     diag: wp.array[wp.mat33],
     tangents: wp.array[ContactTangent],
+    has_friction_coupling: wp.array[int],
 ):
     """Accumulate penalty contact forces and block diagonals, and cache the tangent.
 
@@ -178,6 +186,8 @@ def eval_contact_kernel(
         ke = contact_ke[tid] if contact_ke[tid] > 0.0 else ke
         kd = contact_kd[tid] if contact_kd[tid] > 0.0 else kd
         mu *= contact_mu[tid] if contact_mu[tid] > 0.0 else 1.0
+    if contact_friction_mode(shape_friction_mode, s0, s1) == int(ShapeFrictionMode.NONE):
+        mu = 0.0
 
     previous0 = contact_point(b0, w0, point0[tid], x_prev)
     previous1 = contact_point(b1, w1, point1[tid], x_prev)
@@ -195,7 +205,7 @@ def eval_contact_kernel(
     previous1 = contact_point(b1, t1, anchor1, x_prev)
     velocity = ((current1 - previous1) - (current0 - previous0)) / dt + surface
     vt = velocity - wp.dot(n, velocity) * n
-    gn, Hn, gt, Ht = contact_response(gap, n, vn, vt, ke, kd, kf, mu, dt)
+    gn, Hn, gt, Ht, friction_load_derivative = contact_response(gap, n, vn, vt, ke, kd, kf, mu, dt)
 
     for side in range(2):
         body = b0
@@ -222,7 +232,11 @@ def eval_contact_kernel(
     tangent.friction_weights1 = t1
     tangent.normal_hessian = Hn
     tangent.friction_hessian = Ht
+    tangent.normal = n
+    tangent.friction_load_derivative = friction_load_derivative
     tangents[tid] = tangent
+    if wp.length_sq(friction_load_derivative) > 0.0:
+        wp.atomic_max(has_friction_coupling, 0, 1)
 
 
 @wp.kernel
@@ -262,6 +276,28 @@ def contact_off_diag_multiply_kernel(
 
 
 @wp.kernel
+def friction_load_multiply_kernel(
+    x: wp.array[wp.vec3],
+    tangents: wp.array[ContactTangent],
+    # outputs
+    Ax: wp.array[wp.vec3],
+):
+    """Add the full product of the normal-load derivative of sliding friction."""
+    tangent = tangents[wp.tid()]
+    if tangent.active == 0 or wp.length_sq(tangent.friction_load_derivative) == 0.0:
+        return
+    normal_dx = contact_point(tangent.body1, tangent.weights1, wp.vec3(0.0), x) - contact_point(
+        tangent.body0, tangent.weights0, wp.vec3(0.0), x
+    )
+    friction_product = tangent.friction_load_derivative * wp.dot(tangent.normal, normal_dx)
+    for i in range(4):
+        if tangent.body0 >= 0:
+            wp.atomic_sub(Ax, 4 * tangent.body0 + i, tangent.friction_weights0[i] * friction_product)
+        if tangent.body1 >= 0:
+            wp.atomic_add(Ax, 4 * tangent.body1 + i, tangent.friction_weights1[i] * friction_product)
+
+
+@wp.kernel
 def eval_soft_contact_kernel(
     x: wp.array[wp.vec3],
     x_prev: wp.array[wp.vec3],
@@ -274,6 +310,7 @@ def eval_soft_contact_kernel(
     shape_body: wp.array[int],
     shape_margin: wp.array[float],
     shape_mu: wp.array[float],
+    shape_friction_mode: wp.array[wp.int32],
     ke: float,
     kd: float,
     kf: float,
@@ -335,7 +372,10 @@ def eval_soft_contact_kernel(
     velocity = ((x[particle] - x_prev[particle]) - (current - previous)) / dt - surface
     vn = wp.dot(n, velocity)
     vt = velocity - vn * n
-    gn, Hn, gt, Ht = contact_response(
+    contact_mu = wp.sqrt(wp.max(0.0, mu * shape_mu[shape]))
+    if contact_friction_mode(shape_friction_mode, shape, -1) == int(ShapeFrictionMode.NONE):
+        contact_mu = 0.0
+    gn, Hn, gt, Ht, _ = contact_response(
         gap,
         n,
         vn,
@@ -343,7 +383,7 @@ def eval_soft_contact_kernel(
         wp.max(ke, 0.0),
         wp.max(kd, 0.0),
         wp.max(kf, 0.0),
-        wp.sqrt(wp.max(0.0, mu * shape_mu[shape])),
+        contact_mu,
         dt,
     )
     gradient = gn + gt
@@ -389,16 +429,18 @@ def soft_contact_off_diag_multiply_kernel(
 class Contact:
     """Assemble contact forces and retain per-iteration matrix-free tangents.
 
-    Handle rigid-rigid and particle-rigid contacts in [particles, affine bodies].
+    Handle rigid-rigid and particle-shape contacts in [particles, affine bodies].
     Bodies outside the active solve contribute prescribed motion through their
-    inertial targets. Particle-only solves retain the cloth collision path.
+    inertial targets. World-attached shapes need no affine coordinates.
     """
 
     def __init__(self, model: Model, particle_count: int) -> None:
         self.model = model
         self.particle_count = particle_count
-        self._tangents = wp.zeros(model.rigid_contact_max or 0, dtype=ContactTangent, device=model.device)
+        rigid_contact_max = (model.rigid_contact_max or 0) if model.body_count else 0
+        self._tangents = wp.zeros(rigid_contact_max, dtype=ContactTangent, device=model.device)
         self._soft_tangents = wp.zeros(0, dtype=SoftContactTangent, device=model.device)
+        self.has_friction_coupling = wp.zeros(1, dtype=int, device=model.device)
 
     def eval_contacts(
         self,
@@ -412,48 +454,59 @@ class Contact:
         dt: float,
     ) -> None:
         """Accumulate forces and diagonal blocks after orthogonality evaluation."""
+        if self.model.body_count:
+            self.has_friction_coupling.zero_()
         if contacts is None:
             self._tangents.zero_()
             self._soft_tangents.zero_()
             return
 
-        if contacts.rigid_contact_max > len(self._tangents):
-            self._tangents = wp.zeros(contacts.rigid_contact_max, dtype=ContactTangent, device=self.model.device)
-
         offset = self.particle_count
-        wp.launch(
-            eval_contact_kernel,
-            dim=len(self._tangents),
-            inputs=[
-                x[offset:],
-                x_prev[offset:],
-                x_inertia[offset:],
-                solver_flags[offset:],
-                self.model.body_com,
-                self.model.shape_body,
-                self.model.shape_material_ke,
-                self.model.shape_material_kd,
-                self.model.shape_material_kf,
-                self.model.shape_material_mu,
-                contacts.rigid_contact_count,
-                contacts.rigid_contact_shape0,
-                contacts.rigid_contact_shape1,
-                contacts.rigid_contact_point0,
-                contacts.rigid_contact_point1,
-                contacts.rigid_contact_offset0,
-                contacts.rigid_contact_offset1,
-                contacts.rigid_contact_normal,
-                contacts.rigid_contact_margin0,
-                contacts.rigid_contact_margin1,
-                contacts.rigid_contact_stiffness,
-                contacts.rigid_contact_damping,
-                contacts.rigid_contact_friction,
-                contacts.rigid_contact_surface_velocity,
-                dt,
-            ],
-            outputs=[rhs[offset:], diag[offset:], self._tangents],
-            device=self.model.device,
-        )
+        has_bodies = self.model.body_count > 0
+        affine_x = x[offset:] if has_bodies else None
+        affine_prev = x_prev[offset:] if has_bodies else None
+        affine_inertia = x_inertia[offset:] if has_bodies else None
+        affine_flags = solver_flags[offset:] if has_bodies else None
+
+        if has_bodies:
+            if contacts.rigid_contact_max > len(self._tangents):
+                self._tangents = wp.zeros(contacts.rigid_contact_max, dtype=ContactTangent, device=self.model.device)
+
+            wp.launch(
+                eval_contact_kernel,
+                dim=len(self._tangents),
+                inputs=[
+                    affine_x,
+                    affine_prev,
+                    affine_inertia,
+                    affine_flags,
+                    self.model.body_com,
+                    self.model.shape_body,
+                    self.model.shape_material_ke,
+                    self.model.shape_material_kd,
+                    self.model.shape_material_kf,
+                    self.model.shape_material_mu,
+                    self.model.shape_material_friction_mode,
+                    contacts.rigid_contact_count,
+                    contacts.rigid_contact_shape0,
+                    contacts.rigid_contact_shape1,
+                    contacts.rigid_contact_point0,
+                    contacts.rigid_contact_point1,
+                    contacts.rigid_contact_offset0,
+                    contacts.rigid_contact_offset1,
+                    contacts.rigid_contact_normal,
+                    contacts.rigid_contact_margin0,
+                    contacts.rigid_contact_margin1,
+                    contacts.rigid_contact_stiffness,
+                    contacts.rigid_contact_damping,
+                    contacts.rigid_contact_friction,
+                    contacts.rigid_contact_surface_velocity,
+                    dt,
+                ],
+                outputs=[rhs[offset:], diag[offset:], self._tangents, self.has_friction_coupling],
+                device=self.model.device,
+            )
+
         if self.particle_count:
             contacts._assert_particle_only_soft_contacts("SolverStyle3D")
             if contacts.soft_contact_max > len(self._soft_tangents):
@@ -466,15 +519,16 @@ class Contact:
                 inputs=[
                     x,
                     x_prev,
-                    x[offset:],
-                    x_prev[offset:],
-                    x_inertia[offset:],
-                    solver_flags[offset:],
+                    affine_x,
+                    affine_prev,
+                    affine_inertia,
+                    affine_flags,
                     self.model.body_com,
                     self.model.particle_radius,
                     self.model.shape_body,
                     self.model.shape_margin,
                     self.model.shape_material_mu,
+                    self.model.shape_material_friction_mode,
                     self.model.soft_contact_ke,
                     self.model.soft_contact_kd,
                     self.model.soft_contact_kf,
@@ -494,6 +548,9 @@ class Contact:
 
     def off_diag_multiply(self, x: wp.array[wp.vec3], Ax: wp.array[wp.vec3]) -> None:
         """Add the cached contact off-diagonal product to caller-owned storage."""
+        if not self.model.body_count:
+            return
+
         wp.launch(
             contact_off_diag_multiply_kernel,
             dim=len(self._tangents),
@@ -509,3 +566,13 @@ class Contact:
                 outputs=[Ax],
                 device=self.model.device,
             )
+
+    def friction_load_multiply(self, x: wp.array[wp.vec3], Ax: wp.array[wp.vec3]) -> None:
+        """Add the nonsymmetric rigid friction coupling to the caller's product."""
+        wp.launch(
+            friction_load_multiply_kernel,
+            dim=len(self._tangents),
+            inputs=[x[self.particle_count :], self._tangents],
+            outputs=[Ax[self.particle_count :]],
+            device=self.model.device,
+        )

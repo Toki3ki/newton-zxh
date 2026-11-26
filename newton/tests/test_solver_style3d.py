@@ -13,6 +13,7 @@ import newton
 from newton import NewtonDeprecationWarning
 from newton._src.solvers.style3d.affine_body import AffineBody
 from newton._src.solvers.style3d.builder import PDMatrixBuilder, _compute_max_neighbors
+from newton._src.solvers.style3d.linear_solver import PcgSolver
 from newton.tests.unittest_utils import add_function_test, get_test_devices
 
 
@@ -425,6 +426,22 @@ def test_config_constructor_options(test, device):
             for array, expected in zip(arrays, before, strict=True):
                 np.testing.assert_array_equal(array.numpy(), expected)
 
+    none_solver = newton.solvers.SolverStyle3D(
+        model,
+        config=replace(valid_config),
+        dynamics=newton.solvers.SolverStyle3D.Dynamics.NONE,
+    )
+    none_solver.step(state_in, state_out, control, contacts, 0.01)
+    for array, expected in zip(arrays, before, strict=True):
+        np.testing.assert_array_equal(array.numpy(), expected)
+
+    none_solver.config.iterations = 0
+    with test.subTest(dynamics=none_solver.dynamics, invalid_iterations=0):
+        with test.assertRaisesRegex(ValueError, "Config.iterations must be at least 1"):
+            none_solver.step(state_in, state_out, control, contacts, 0.01)
+        for array, expected in zip(arrays, before, strict=True):
+            np.testing.assert_array_equal(array.numpy(), expected)
+
     solver.config = valid_config
     actual = solve(solver)
     np.testing.assert_allclose(actual[0], previous[0], atol=1e-6)
@@ -755,6 +772,59 @@ def test_global_particles_use_global_gravity(test, device):
     test.assertTrue(np.all(state_1.particle_qd.numpy()[:, 2] < -1.0e-6))
 
 
+def test_dynamics_with_empty_ranges(test, device):
+    """Advance the selected entities even when a solver range is empty."""
+    solver_type = newton.solvers.SolverStyle3D
+    dynamics = solver_type.Dynamics
+    dt = 0.01
+    gravity = -2.0
+    for scene in ("cloth", "rigid", "empty"):
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, gravity))
+        if scene == "cloth":
+            solver_type.register_custom_attributes(builder)
+            newton.solvers.style3d.add_cloth_grid(
+                builder,
+                pos=(0.0, 0.0, 1.0),
+                rot=wp.quat_identity(),
+                vel=(0.0, 0.0, 0.0),
+                dim_x=2,
+                dim_y=2,
+                cell_x=0.1,
+                cell_y=0.1,
+                mass=0.1,
+            )
+        elif scene == "rigid":
+            builder.add_body(
+                xform=wp.transform((0.0, 0.0, 1.0), wp.quat_identity()), mass=1.0, inertia=wp.mat33(np.eye(3))
+            )
+        model = builder.finalize(device=device)
+        state_in, state_out = model.state(), model.state()
+        for mode in (dynamics.DEFORMABLE, dynamics.AFFINE_BODY, dynamics.ALL, dynamics.NONE):
+            with test.subTest(scene=scene, dynamics=mode.name):
+                solver = solver_type(model, dynamics=mode, config=solver_type.Config(iterations=2, linear_iterations=4))
+                state_out.assign(state_in)
+                if scene == "cloth":
+                    state_out.particle_qd.fill_(wp.vec3(7.0))
+                elif scene == "rigid":
+                    state_out.body_qd.fill_(wp.spatial_vector(7.0))
+                solver.step(state_in, state_out, None, None, dt)
+
+                if scene == "cloth":
+                    advance = bool(mode & dynamics.DEFORMABLE)
+                    z = state_out.particle_q.numpy()[:, 2]
+                    vz = state_out.particle_qd.numpy()[:, 2]
+                    expected_vz = 0.998 * gravity * dt if advance else 7.0
+                elif scene == "rigid":
+                    advance = bool(mode & dynamics.AFFINE_BODY)
+                    z = state_out.body_q.numpy()[:, 2]
+                    vz = state_out.body_qd.numpy()[:, 2]
+                    expected_vz = gravity * dt if advance else 7.0
+                else:
+                    continue
+                np.testing.assert_allclose(z, 1.0 + (gravity * dt**2 if advance else 0.0), atol=1e-6)
+                np.testing.assert_allclose(vz, expected_vz, atol=1e-5)
+
+
 @wp.kernel
 def _advance_affine_coordinates(x: wp.array[wp.vec3], x_inertia: wp.array[wp.vec3], v: wp.array[wp.vec3], dt: float):
     coordinate = wp.tid()
@@ -1066,6 +1136,8 @@ def test_rigid_contact_linear_system(test, device):
     """Match contact forces and the split tangent against a dense affine Jacobian."""
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     rotation = wp.quat_from_axis_angle(wp.normalize(wp.vec3(1.0, 2.0, -1.0)), 0.4)
+    sliding = newton.ModelBuilder.ShapeConfig(density=0.0, ke=200.0, kd=4.0, kf=40.0, mu=0.5)
+    frictionless = replace(sliding, friction_mode=newton.ShapeFrictionMode.NONE)
     for i in range(2):
         body = builder.add_link(
             xform=wp.transform(wp.vec3(0.0, 0.0, 0.8 * i), rotation),
@@ -1073,9 +1145,9 @@ def test_rigid_contact_linear_system(test, device):
             mass=2.0,
             inertia=wp.mat33(np.eye(3) * 0.4),
         )
-        builder.add_shape_sphere(
-            body, radius=0.5, cfg=newton.ModelBuilder.ShapeConfig(density=0.0, ke=200.0, kd=4.0, kf=40.0, mu=0.5)
-        )
+        builder.add_shape_sphere(body, radius=0.5, cfg=frictionless if i == 0 else sliding)
+    # Select either material on the second body using the same contact geometry.
+    frictionless_shape = builder.add_shape_sphere(1, radius=0.5, cfg=frictionless)
     model = builder.finalize(device=device)
     config = newton.solvers.SolverStyle3D.Config(iterations=1, linear_iterations=0, affine_rigidity_ratio=0.0)
     solver = newton.solvers.SolverStyle3D(
@@ -1087,7 +1159,6 @@ def test_rigid_contact_linear_system(test, device):
     )
     contacts.rigid_contact_count.fill_(2)
     contacts.rigid_contact_shape0.fill_(0)
-    contacts.rigid_contact_shape1.fill_(1)
     contacts.rigid_contact_normal.fill_(wp.vec3(0.0, 0.0, 1.0))
     contacts.rigid_contact_margin0.fill_(0.03)
     contacts.rigid_contact_margin1.fill_(0.02)
@@ -1114,21 +1185,23 @@ def test_rigid_contact_linear_system(test, device):
     projector = np.eye(3) - np.outer(n, n)
 
     # Exercise both stationary and rotating kinematic boundaries under applied loads.
-    for mode in ("normal", "stick", "slip", "prescribed_rest", "prescribed"):
+    for mode in ("normal", "none", "stick", "slip", "prescribed_rest", "prescribed", "prescribed_slip"):
         with test.subTest(mode=mode):
             prescribed = mode.startswith("prescribed")
+            slipping = mode.endswith("slip") or mode == "none"
+            contacts.rigid_contact_shape1.fill_(frictionless_shape if mode == "none" else 1)
             model.shape_material_mu.fill_(0.0 if mode == "normal" else 0.5)
             ke, kd, mu = 200.0, 4.0, 0.0 if mode == "normal" else 0.5
-            if mode == "slip":
+            if slipping:
                 contacts.rigid_contact_stiffness.fill_(320.0)
                 contacts.rigid_contact_damping.fill_(7.0)
                 contacts.rigid_contact_friction.fill_(2.0)
-                ke, kd, mu = 320.0, 7.0, 1.0
+                ke, kd, mu = 320.0, 7.0, 0.0 if mode == "none" else 1.0
             else:
                 contacts.rigid_contact_stiffness.zero_()
                 contacts.rigid_contact_damping.zero_()
                 contacts.rigid_contact_friction.zero_()
-            surface = np.array([5.0 if mode == "slip" else 0.01, 0.0, -0.2])
+            surface = np.array([5.0 if slipping else 0.01, 0.0, -0.2])
             contacts.rigid_contact_surface_velocity.fill_(wp.vec3(*surface))
             if prescribed:
                 flags = newton.BodyFlags.KINEMATIC
@@ -1156,6 +1229,7 @@ def test_rigid_contact_linear_system(test, device):
                 current[4:] = predicted
             expected_rhs = (mass @ (target - initial).reshape(-1)).reshape(8, 3)
             hessian = np.zeros((24, 24))
+            coupling = np.zeros_like(hessian)
             for contact in range(2):
                 weights = [np.r_[1.0, points[b][contact] - com[b]] for b in range(2)]
                 anchors = [np.r_[1.0, points[b][contact] + offsets[b] - com[b]] for b in range(2)]
@@ -1164,7 +1238,8 @@ def test_rigid_contact_linear_system(test, device):
                 gap = n @ (w @ current) - 0.05
                 vn = n @ (w @ (current - initial) / dt)
                 gn = (ke * gap + kd * min(vn, 0.0)) * n
-                hn = (ke + (kd / dt if vn < 0.0 else 0.0)) * np.outer(n, n)
+                normal_stiffness = ke + (kd / dt if vn < 0.0 else 0.0)
+                hn = normal_stiffness * np.outer(n, n)
                 vt = projector @ (t @ (current - initial) / dt + surface)
                 speed = np.linalg.norm(vt)
                 limit = mu * -gn[2]
@@ -1176,6 +1251,7 @@ def test_rigid_contact_linear_system(test, device):
                         direction = vt / speed
                         gt = limit * direction
                         ht = limit / (dt * speed) * projector
+                        coupling -= mu * normal_stiffness * np.kron(np.outer(t, w), np.outer(direction, n))
                 expected_rhs -= w[:, None] * gn + t[:, None] * gt
                 hessian += np.kron(np.outer(w, w), hn) + np.kron(np.outer(t, t), ht)
             matrix = mass + hessian
@@ -1190,14 +1266,19 @@ def test_rigid_contact_linear_system(test, device):
             np.testing.assert_allclose(
                 solver._linear_solver.Ap.numpy().reshape(-1), matrix @ probe.reshape(-1), rtol=3e-6, atol=5e-4
             )
-            # One Newton solve verifies that the same tangent reaches the actual PCG solve.
+            # Compare the PCG step and its one full-residual correction with dense solves.
             config.linear_iterations = 32
             solver.step(state_in, state_out, None, contacts, dt)
             active_size = 12 if prescribed else 24
             expected = initial.reshape(-1).copy()
-            expected[:active_size] += np.linalg.solve(
-                matrix[:active_size, :active_size], expected_rhs.reshape(-1)[:active_size]
-            )
+            active_matrix = matrix[:active_size, :active_size]
+            full_matrix = active_matrix + coupling[:active_size, :active_size]
+            rhs = expected_rhs.reshape(-1)[:active_size]
+            increment = np.linalg.solve(active_matrix, rhs)
+            residual = rhs - full_matrix @ increment
+            corrected = increment + np.linalg.solve(active_matrix, residual)
+            test.assertLessEqual(np.linalg.norm(rhs - full_matrix @ corrected), np.linalg.norm(residual) + 1e-12)
+            expected[:active_size] += corrected
             np.testing.assert_allclose(solver._x.numpy().reshape(-1), expected, atol=3e-6)
             if prescribed:
                 np.testing.assert_array_equal(state_out.body_q.numpy()[1], state_in.body_q.numpy()[1])
@@ -1240,9 +1321,10 @@ def test_rigid_contact_linear_system(test, device):
 
 
 def test_soft_contact_linear_system(test, device):
-    """Couple particle and affine contact forces, diagonals, and PCG products."""
+    """Verify soft contact forces and the linear solve with and without affine bodies."""
     builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
     newton.solvers.SolverStyle3D.register_custom_attributes(builder)
+    particle_radius = 0.1
     newton.solvers.style3d.add_cloth_grid(
         builder,
         pos=(0.2, -0.1, 0.08),
@@ -1253,15 +1335,17 @@ def test_soft_contact_linear_system(test, device):
         cell_x=0.5,
         cell_y=0.5,
         mass=0.5,
-        particle_radius=0.1,
+        particle_radius=particle_radius,
         tri_aniso_ke=wp.vec3(0.0),
         edge_aniso_ke=wp.vec3(0.0),
     )
+    cfg = newton.ModelBuilder.ShapeConfig(density=0.0, margin=0.02, mu=0.8)
+    ground = builder.add_ground_plane(cfg=cfg)
+    frictionless_ground = builder.add_ground_plane(cfg=replace(cfg, friction_mode=newton.ShapeFrictionMode.NONE))
+    body_free_model = builder.finalize(device=device)
     pose = wp.transform(wp.vec3(0.1, 0.05, -0.1), wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), 0.4))
     body = builder.add_link(xform=pose, com=(0.03, -0.02, 0.01), mass=2.0, inertia=wp.mat33(np.eye(3) * 0.4))
-    cfg = newton.ModelBuilder.ShapeConfig(density=0.0, margin=0.02, mu=0.8)
-    builder.add_shape_box(body, hx=0.3, hy=0.3, hz=0.1, cfg=cfg)
-    builder.add_ground_plane(cfg=cfg)
+    box = builder.add_shape_box(body, hx=0.3, hy=0.3, hz=0.1, cfg=cfg)
     model = builder.finalize(device=device)
     model.soft_contact_ke = 400.0
     model.soft_contact_kd = 3.0
@@ -1273,7 +1357,7 @@ def test_soft_contact_linear_system(test, device):
     contacts = newton.Contacts(0, 2, device=device)
     contacts.soft_contact_count.fill_(1)
     contacts.soft_contact_particle.fill_(0)
-    contacts.soft_contact_shape.fill_(0)
+    contacts.soft_contact_shape.fill_(box)
     contacts.soft_contact_normal.fill_(wp.vec3(0.0, 0.0, 1.0))
     point_world = wp.vec3(0.2, -0.1, 0.0)
     local_point = np.array(wp.transform_point(wp.transform_inverse(pose), point_world))
@@ -1297,7 +1381,7 @@ def test_soft_contact_linear_system(test, device):
             state_in.body_qd.fill_(wp.spatial_vector(0.0, 0.0, 0.2 if kinematic else 0.0, 0.0, 0.0, 0.0))
             state_out.body_q.fill_(wp.transform_identity())
             state_out.body_qd.fill_(wp.spatial_vector(17.0))
-            contacts.soft_contact_shape.fill_(1 if mode == "static" else 0)
+            contacts.soft_contact_shape.fill_(ground if mode == "static" else box)
             contacts.soft_contact_body_pos.fill_(point_world if mode == "static" else wp.vec3(local_point))
             surface = wp.vec3(5.0 if mode == "slip" else 0.01, 0.0, -0.03 if mode == "separating" else 0.03)
             contacts.soft_contact_body_vel.fill_(surface)
@@ -1319,7 +1403,7 @@ def test_soft_contact_linear_system(test, device):
             else:
                 relative = w @ current
                 surface_world = current[5:].T @ np.array(surface)
-            gap = relative[2] - 0.12
+            gap = relative[2] - particle_radius - cfg.margin
             velocity = w @ (current - initial) / dt - surface_world
             gn = 400.0 * gap + 3.0 * min(velocity[2], 0.0)
             ht = np.diag([1.0, 1.0, 0.0])
@@ -1365,7 +1449,7 @@ def test_soft_contact_linear_system(test, device):
             if mode == "pinned":
                 np.testing.assert_array_equal(state_out.particle_q.numpy(), state_in.particle_q.numpy())
 
-    contacts.soft_contact_shape.fill_(0)
+    contacts.soft_contact_shape.fill_(box)
     contacts.soft_contact_body_pos.fill_(wp.vec3(local_point))
     config.linear_iterations = 0
     graph = None
@@ -1390,6 +1474,39 @@ def test_soft_contact_linear_system(test, device):
     np.testing.assert_allclose(
         solver._A_diag.numpy(), solver._A_diag_base.numpy()[:, None, None] * np.eye(3), atol=1e-5
     )
+
+    body_free_model.soft_contact_ke = model.soft_contact_ke
+    body_free_model.soft_contact_kd = model.soft_contact_kd
+    body_free_model.soft_contact_mu = model.soft_contact_mu
+    config.linear_iterations = 4
+    body_free_solver = newton.solvers.SolverStyle3D(
+        body_free_model, config=config, dynamics=newton.solvers.SolverStyle3D.Dynamics.ALL
+    )
+    cloth_in, cloth_out = body_free_model.state(), body_free_model.state()
+    surface_speed = 0.1
+    contacts.soft_contact_count.fill_(1)
+    contacts.soft_contact_body_pos.fill_(point_world)
+    contacts.soft_contact_body_vel.fill_(wp.vec3(surface_speed, 0.0, 0.0))
+    initial = cloth_in.particle_q.numpy()
+    mass_diag = body_free_model.particle_mass.numpy()[0] / dt**2
+    penetration = particle_radius + cfg.margin - initial[0, 2]
+    ke = body_free_model.soft_contact_ke
+    for shape, kf in ((ground, 0.0), (ground, model.soft_contact_kf), (frictionless_ground, model.soft_contact_kf)):
+        with test.subTest(mode="body_free_static", shape=shape, kf=kf):
+            contacts.soft_contact_shape.fill_(shape)
+            body_free_model.soft_contact_kf = kf
+            body_free_solver.step(cloth_in, cloth_out, None, contacts, dt)
+            expected = initial.copy()
+            # The prescribed surface speed keeps friction below the Coulomb limit.
+            gain = 0.0 if shape == frictionless_ground else kf
+            expected[0, 0] += gain * surface_speed / (mass_diag + gain / dt)
+            expected[0, 2] += ke * penetration / (mass_diag + ke)
+            np.testing.assert_allclose(cloth_out.particle_q.numpy(), expected, atol=3e-6)
+            np.testing.assert_allclose(
+                body_free_solver._A_diag.numpy()[0],
+                np.diag([gain / dt, gain / dt, ke]) + mass_diag * np.eye(3),
+                rtol=1e-6,
+            )
 
 
 def test_rigid_contact_stacking(test, device):
@@ -1474,6 +1591,105 @@ def test_rigid_contact_friction_stability(test, device):
         test.assertGreater(float(poses[:, 2].min()), 0.0, msg=f"frame {frame}")
     # Stability must still allow contact-driven motion to reach the last box.
     test.assertLess(float(poses[-1, 2]), 0.12)
+
+
+def test_captured_pcg_dot(test, device):
+    """Reduce multiple blocks and a partial final block inside a conditional CUDA graph."""
+    if not wp.is_conditional_graph_supported():
+        test.skipTest("CUDA conditional nodes require CUDA 12.4 or newer")
+    size = 65_537
+    solver = PcgSolver(size, device, maxIter=2)
+    solver.r.fill_(wp.vec3(1.0, -2.0, 3.0))
+    solver.rTz.fill_(-1.0)
+    enabled = wp.ones(1, dtype=int, device=device)
+    with wp.ScopedCapture(device=device) as capture:
+        wp.capture_if(enabled, on_true=lambda: solver.step3_update_rTz(1, solver.dot))
+    for scale in (1.0, -2.0):
+        solver.z.fill_(wp.vec3(3.0 * scale, 4.0 * scale, 2.0 * scale))
+        wp.capture_launch(capture.graph)
+        np.testing.assert_array_equal(solver.rTz.numpy(), [-1.0, size * scale])
+
+
+def test_rigid_contact_sliding_box(test, device):
+    """Match the Coulomb stopping distance and impulse bound for a stiff four-point contact."""
+    gravity, mu, initial_speed, dt = 9.81, 0.5, 2.0, 0.005
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, -gravity))
+    material = newton.ModelBuilder.ShapeConfig(density=1000.0, ke=1.0e7, kd=1.0e3, kf=1.0e4, mu=mu)
+    builder.add_ground_plane(cfg=material)
+    body = builder.add_link(xform=wp.transform((0.0, 0.0, 0.1), wp.quat_identity()))
+    builder.add_shape_box(body, hx=0.1, hy=0.1, hz=0.1, cfg=material)
+    model = builder.finalize(device=device)
+    solver = newton.solvers.SolverStyle3D(
+        model,
+        config=newton.solvers.SolverStyle3D.Config(iterations=10, linear_iterations=20, affine_rigidity_ratio=1.0e4),
+        dynamics=newton.solvers.SolverStyle3D.Dynamics.AFFINE_BODY,
+    )
+    pipeline = newton.CollisionPipeline(model)
+    contacts = pipeline.contacts()
+    state_in, state_out = model.state(), model.state()
+    state_in.body_qd.fill_(wp.spatial_vector(initial_speed, 0.0, 0.0, 0.0, 0.0, 0.0))
+
+    def advance():
+        pipeline.collide(state_in, contacts)
+        solver.step(state_in, state_out, None, contacts, dt)
+        state_in.assign(state_out)
+
+    graph = None
+    if wp.get_device(device).is_cuda:
+        with wp.ScopedCapture(device=device) as capture:
+            advance()
+        graph = capture.graph
+    velocities = []
+    for _ in range(85):
+        if graph is None:
+            advance()
+        else:
+            wp.capture_launch(graph)
+        velocities.append(state_in.body_qd.numpy()[body, :3].copy())
+
+    vx, _, vz = np.asarray(velocities, dtype=np.float64).T
+    times = dt * np.arange(1, len(vx) + 1)
+    reference_x = dt * np.maximum(initial_speed - mu * gravity * times, 0.0).sum()
+    test.assertAlmostEqual(float(state_in.body_q.numpy()[body, 0]), reference_x, delta=1e-3)
+    test.assertAlmostEqual(float(vx[-1]), 0.0, delta=0.03)
+    test.assertLess(float(np.max(initial_speed - vx - mu * (gravity * times + vz))), 0.01)
+    test.assertAlmostEqual(float(-np.polyfit(times[4:34], vx[4:34], 1)[0]), mu * gravity, delta=0.03)
+
+    # Replay one nonlinear iteration with a sliding box and a prescribed belt speed.
+    # A negative sentinel detects a correction solve even if its result is discarded.
+    solver.config.iterations = 1
+    state_in.body_q.fill_(wp.transform((0.0, 0.0, 0.099998), wp.quat_identity()))
+    state_in.body_qd.fill_(wp.spatial_vector(initial_speed, 0.0, 0.0, 0.0, 0.0, 0.0))
+    pipeline.collide(state_in, contacts)
+    contact_count = int(contacts.rigid_contact_count.numpy()[0])
+    test.assertGreater(contact_count, 0)
+    contacts.rigid_contact_surface_velocity = wp.zeros(contacts.rigid_contact_max, dtype=wp.vec3, device=device)
+    graph = None
+    if wp.get_device(device).is_cuda and wp.is_conditional_graph_supported():
+        with wp.ScopedCapture(device=device) as capture:
+            solver.step(state_in, state_out, None, contacts, dt)
+        graph = capture.graph
+    for count, friction, belt_speed in (
+        (contact_count, mu, 0.0),
+        (contact_count, mu, 2.0),
+        (0, mu, 2.0),
+        (contact_count, 0.0, 2.0),
+    ):
+        with test.subTest(count=count, friction=friction, belt_speed=belt_speed):
+            contacts.rigid_contact_count.fill_(count)
+            model.shape_material_mu.fill_(friction)
+            contacts.rigid_contact_surface_velocity.fill_(wp.vec3(belt_speed, 0.0, 0.0))
+            solver._friction_residual_norms_sq.fill_(-1.0)
+            if graph is None:
+                solver.step(state_in, state_out, None, contacts, dt)
+            else:
+                wp.capture_launch(graph)
+            norms = solver._friction_residual_norms_sq.numpy()
+            if count and friction and belt_speed:
+                test.assertGreater(norms[0], norms[1])
+                test.assertGreaterEqual(norms[1], 0.0)
+            else:
+                np.testing.assert_array_equal(norms, -1.0)
 
 
 def test_affine_body_state_conversion(test, device):
@@ -1653,6 +1869,20 @@ add_function_test(
     devices=devices,
     check_output=False,
 )
+add_function_test(
+    TestSolverStyle3D,
+    "test_captured_pcg_dot",
+    test_captured_pcg_dot,
+    devices=[device for device in devices if device.is_cuda],
+    check_output=False,
+)
+add_function_test(
+    TestSolverStyle3D,
+    "test_rigid_contact_sliding_box",
+    test_rigid_contact_sliding_box,
+    devices=devices,
+    check_output=False,
+)
 
 
 add_function_test(
@@ -1733,6 +1963,14 @@ add_function_test(
     TestSolverStyle3D,
     "test_global_particles_use_global_gravity",
     test_global_particles_use_global_gravity,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverStyle3D,
+    "test_dynamics_with_empty_ranges",
+    test_dynamics_with_empty_ranges,
     devices=devices,
     check_output=False,
 )
