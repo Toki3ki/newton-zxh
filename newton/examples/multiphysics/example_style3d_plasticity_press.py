@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Press an isochorically plastic pad with a cross or apple die.
+"""Press an isochorically plastic pad with an apple die.
 
 The die cycles down into an elastic tetrahedral pad, holds briefly, then lifts.
 Style3D's per-volume yield strain lets the pad recover elastically below yield
@@ -14,9 +14,8 @@ Success criteria:
 
 Runs:
 - `python -m newton.examples style3d_plasticity_press`
-- `python -m newton.examples style3d_plasticity_press --die apple`
 
-In apple mode an opposing hammer stamps "NEWTON" after the apple lifts.
+An opposing hammer stamps "NEWTON" after the apple lifts.
 """
 
 import math
@@ -33,11 +32,11 @@ from newton.solvers import SolverStyle3D
 FPS = 60
 SUBSTEPS = 2
 SUBSTEP_DT = 1.0 / (FPS * SUBSTEPS)
-PRESS_PERIOD = 1.5
 OPEN_ANGLE = 1.28
 PRESS_DOWN_TIME = 0.7
 PRESS_HOLD_TIME = 0.3
 PRESS_UP_TIME = 0.7
+PRESS_PERIOD = PRESS_DOWN_TIME + PRESS_HOLD_TIME + PRESS_UP_TIME
 # Pad dimensions [m]; subdivision counts change resolution without changing size.
 PAD_LENGTH = 0.72
 PAD_WIDTH = 0.72
@@ -97,15 +96,14 @@ def _drive_press_kernel(
     joint_q: wp.array[float],
     joint_qd: wp.array[float],
 ):
-    period = hammer_period * float(wp.min(2, joint_q.shape[0])) + after_hammers
+    period = 2.0 * hammer_period + after_hammers
     time = clock[0] % period
     angle, rate = _press_motion(time * hammer_speed)
     joint_q[0] = angle
     joint_qd[0] = rate * hammer_speed
-    if joint_q.shape[0] >= 2:
-        angle, rate = _press_motion(((time + period - hammer_period) % period) * hammer_speed)
-        joint_q[1] = angle
-        joint_qd[1] = rate * hammer_speed
+    angle, rate = _press_motion(((time + period - hammer_period) % period) * hammer_speed)
+    joint_q[1] = angle
+    joint_qd[1] = rate * hammer_speed
     clock[0] += dt
 
 
@@ -165,7 +163,6 @@ class Example:
     after_hammers = 0.0
 
     def __init__(self, viewer, args):
-        self.die = getattr(args, "die", "cross")
         self.viewer = viewer
         self.sim_time = 0.0
         self.frame_dt = 1.0 / FPS
@@ -189,7 +186,7 @@ class Example:
             color=steel,
         )
         press_body = builder.add_link(is_kinematic=True, label="swing_arm")
-        head_x = -0.52 + (APPLE_OFFSET_X if self.die == "apple" else 0.0)
+        head_x = -0.52 + APPLE_OFFSET_X
         across = wp.quat_from_axis_angle(wp.vec3(0, 1, 0), math.pi / 2)
         builder.add_shape_cylinder(
             press_body,
@@ -199,30 +196,24 @@ class Example:
             color=steel,
         )
         head = wp.transform((head_x, 0, 0), wp.quat_identity())
-        if self.die == "cross":
-            for hx, hy in ((0.22, 0.055), (0.055, 0.22)):
-                builder.add_shape_box(press_body, xform=head, hx=hx, hy=hy, hz=0.042, color=gold)
-        else:
-            angle = np.linspace(-np.pi, np.pi, 96, endpoint=False)
-            # Shorten the radius at the stem and blossom ends to form the apple's clefts.
-            radius = 1 - 0.38 * np.exp(-((angle / 0.29) ** 2)) - 0.16 * np.exp(-(((np.pi - np.abs(angle)) / 0.32) ** 2))
-            outline = radius[:, None] * np.column_stack(
-                (
-                    0.17 * np.cos(angle),
-                    0.16 * np.sin(angle) * (1 + 0.20 * np.cos(angle)),
-                )
+        angle = np.linspace(-np.pi, np.pi, 96, endpoint=False)
+        # Shorten the radius at the stem and blossom ends to form the apple's clefts.
+        radius = 1 - 0.38 * np.exp(-((angle / 0.29) ** 2)) - 0.16 * np.exp(-(((np.pi - np.abs(angle)) / 0.32) ** 2))
+        outline = radius[:, None] * np.column_stack(
+            (
+                0.17 * np.cos(angle),
+                0.16 * np.sin(angle) * (1 + 0.20 * np.cos(angle)),
             )
-            builder.add_shape_mesh(
-                press_body, xform=head, mesh=_extrude_profile(outline, 0.042), color=(0.57, 0.80, 0.04)
-            )
-            leaf_tilt = wp.quat_from_axis_angle(wp.vec3(0, 0, 1), -0.52)
-            leaf = np.column_stack((0.063 * np.cos(angle), 0.033 * np.sin(angle) * np.abs(np.sin(angle))))
-            builder.add_shape_mesh(
-                press_body,
-                xform=wp.transform((head_x + 0.189, -0.032, 0), leaf_tilt),
-                mesh=_extrude_profile(leaf, 0.042),
-                color=(0.12, 0.48, 0.04),
-            )
+        )
+        builder.add_shape_mesh(press_body, xform=head, mesh=_extrude_profile(outline, 0.042), color=(0.57, 0.80, 0.04))
+        leaf_tilt = wp.quat_from_axis_angle(wp.vec3(0, 0, 1), -0.52)
+        leaf = np.column_stack((0.063 * np.cos(angle), 0.033 * np.sin(angle) * np.abs(np.sin(angle))))
+        builder.add_shape_mesh(
+            press_body,
+            xform=wp.transform((head_x + 0.189, -0.032, 0), leaf_tilt),
+            mesh=_extrude_profile(leaf, 0.042),
+            color=(0.12, 0.48, 0.04),
+        )
         builder.add_shape_cylinder(
             press_body,
             xform=wp.transform((head_x, 0, 0.065), wp.quat_identity()),
@@ -233,8 +224,7 @@ class Example:
         hinge = builder.add_joint_revolute(-1, press_body, parent_xform=pivot, axis=newton.Axis.Y)
         builder.add_articulation([hinge], label="press")
         builder.joint_q[0] = OPEN_ANGLE
-        if self.die == "apple":
-            _add_letter_press(builder, steel, gold)
+        _add_letter_press(builder, steel, gold)
         self._add_feed_press(builder)
         self.model = builder.finalize()
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.model)
@@ -351,10 +341,7 @@ class Example:
         rest = self.model.particle_q.numpy()
         xy = np.abs(rest[:, :2])
         top = np.isclose(rest[:, 2], rest[:, 2].max())
-        if self.die == "cross":
-            footprint = top & (xy.max(axis=1) < 0.205) & (xy.min(axis=1) < 0.025)
-        else:
-            footprint = top & (np.abs(rest[:, 0] - APPLE_OFFSET_X) < 0.09) & (xy[:, 1] < 0.12)
+        footprint = top & (np.abs(rest[:, 0] - APPLE_OFFSET_X) < 0.09) & (xy[:, 1] < 0.12)
         corners = top & (xy.min(axis=1) > 0.18)
         heights = self.state_0.particle_q.numpy()[:, 2]
         assert np.median(heights[corners]) - np.median(heights[footprint]) > 0.01, "The imprint disappeared."
@@ -366,7 +353,5 @@ class Example:
 
 
 if __name__ == "__main__":
-    parser = newton.examples.create_parser()
-    parser.add_argument("--die", choices=("cross", "apple"), default="cross", help="Stamp fitted to the swing arm.")
-    viewer, args = newton.examples.init(parser)
+    viewer, args = newton.examples.init()
     newton.examples.run(Example(viewer, args), args)
