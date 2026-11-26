@@ -26,16 +26,16 @@ FPS = 60
 SCENE_SCALE = 10.0  # Uniform geometric scale; set to 1.0 for the original size.
 # Absolute contact distances [m], independent of SCENE_SCALE.
 PAD_PARTICLE_RADIUS = 0.008  # Particle-to-shape collision radius.
-SOFT_CONTACT_GAP = 0.05  # Extra particle-to-shape contact detection distance.
+SOFT_CONTACT_GAP = 0.01  # Extra particle-to-shape contact detection distance.
 SHAPE_CONTACT_MARGIN = 0.0  # Outward offset of rigid collision surfaces.
-SHAPE_CONTACT_GAP = 0.1  # Extra rigid-shape contact detection distance.
+SHAPE_CONTACT_GAP = 0.01  # Extra rigid-shape contact detection distance.
 SELF_CONTACT_THICKNESS = 0.006  # Full self-contact thickness (twice the internal radius).
 SUBSTEPS = 2
 SUBSTEP_DT = 1.0 / (FPS * SUBSTEPS)
 PRESS_PERIOD = 2.0
 OPEN_ANGLE = 1.28
 PRESS_DOWN_TIME = 0.4
-PRESS_HOLD_TIME = 0.5
+PRESS_HOLD_TIME = 0.75
 PRESS_UP_TIME = 0.9
 # Never restart a stroke before the previous lift has completed.
 PRESS_PERIOD = max(PRESS_PERIOD, PRESS_DOWN_TIME + PRESS_HOLD_TIME + PRESS_UP_TIME + 0.05)
@@ -50,7 +50,7 @@ PAD_YOUNGS_MODULUS = 5.0e3
 PAD_POISSON_RATIO = 0.49
 PAD_YIELD_STRAIN = 0.18
 LOGO_DIE_MAX_SPAN = 0.45
-LOGO_PIVOT_HEIGHT = 0.287
+LOGO_PIVOT_HEIGHT = 0.275
 LOGO_FRAME_ENABLED = True
 LOGO_FRAME_THICKNESS = 0.025
 LOGO_FRAME_CLEARANCE = 0.002
@@ -215,6 +215,28 @@ def _drive_press_kernel(
     clock[0] += dt
 
 
+@wp.kernel
+def _collect_logo_contacts(
+    shapes: wp.array[int],
+    particles: wp.array[int],
+    local_points: wp.array[wp.vec3],
+    normals: wp.array[wp.vec3],
+    body_q: wp.array[wp.transform],
+    particle_q: wp.array[wp.vec3],
+    logo_shape: int,
+    press_body: int,
+    contact_radius: float,
+    points: wp.array[wp.vec3],
+    count: wp.array[int],
+):
+    i = wp.tid()
+    particle = particles[i]
+    if shapes[i] == logo_shape and particle >= 0:
+        point = wp.transform_point(body_q[press_body], local_points[i])
+        if wp.dot(normals[i], particle_q[particle] - point) < contact_radius:
+            points[wp.atomic_add(count, 0, 1)] = point
+
+
 class Example:
     hammer_period = PRESS_PERIOD
     iterations = 10
@@ -261,7 +283,8 @@ class Example:
         logo_mesh.color = wp.vec3(0.82, 0.86, 0.90)
         logo_mesh.metallic = 0.9
         logo_mesh.roughness = 0.24
-        builder.add_shape_mesh(press_body, xform=head, mesh=logo_mesh)
+        self.press_body = press_body
+        self.logo_shape = builder.add_shape_mesh(press_body, xform=head, mesh=logo_mesh)
         hinge = builder.add_joint_revolute(-1, press_body, parent_xform=pivot, axis=newton.Axis.Y)
         builder.add_articulation([hinge], label="press")
         builder.joint_q[0] = OPEN_ANGLE
@@ -270,7 +293,7 @@ class Example:
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.model)
         pad_color = wp.vec3(0.015, 0.015, 0.02)
         self.model.tri_color = wp.full(self.model.tri_count, pad_color, device=self.model.device)
-        self.model.soft_contact_ke = 2.0e2  # important for this example.
+        self.model.soft_contact_ke = 3.0e2  # important for this example.
         self.model.soft_contact_kd = 2.0
         self.model.soft_contact_kf = 10.0
         self.model.soft_contact_mu = 0.5
@@ -289,6 +312,8 @@ class Example:
         self.control = self.model.control()
         self.collision_pipeline = newton.CollisionPipeline(self.model, soft_contact_gap=SOFT_CONTACT_GAP)
         self.contacts = self.collision_pipeline.contacts()
+        self.contact_points = wp.empty(0, dtype=wp.vec3, device=self.model.device)
+        self.contact_point_count = wp.zeros(1, dtype=int, device=self.model.device)
         self.clock = wp.zeros(1, dtype=float, device=self.model.device)
         self.graph = None
 
@@ -425,6 +450,36 @@ class Example:
     def render(self):
         self.viewer.begin_frame(self.sim_time)
         self.viewer.log_state(self.state_0)
+        points = None
+        if self.viewer.show_contacts:
+            contacts = self.contacts
+            size = min(int(contacts.soft_contact_count.numpy()[0]), contacts.soft_contact_max)
+            if size:
+                if size > len(self.contact_points):
+                    self.contact_points = wp.empty(size, dtype=wp.vec3, device=self.model.device)
+                self.contact_point_count.zero_()
+                # After the state swap, state_1 holds the input used for detection.
+                wp.launch(
+                    _collect_logo_contacts,
+                    dim=size,
+                    inputs=[
+                        contacts.soft_contact_shape,
+                        contacts.soft_contact_particle,
+                        contacts.soft_contact_body_pos,
+                        contacts.soft_contact_normal,
+                        self.state_1.body_q,
+                        self.state_1.particle_q,
+                        self.logo_shape,
+                        self.press_body,
+                        PAD_PARTICLE_RADIUS + SHAPE_CONTACT_MARGIN,
+                    ],
+                    outputs=[self.contact_points, self.contact_point_count],
+                    device=self.model.device,
+                )
+                count = int(self.contact_point_count.numpy()[0])
+                if count:
+                    points = self.contact_points[:count]
+        self.viewer.log_points("/contacts/logo_pad", points, radii=0.025, colors=(1.0, 0.24, 0.02))
         self.viewer.end_frame()
 
 
