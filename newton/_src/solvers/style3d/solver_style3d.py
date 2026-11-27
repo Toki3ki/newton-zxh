@@ -981,6 +981,7 @@ class SolverStyle3D(SolverBase):
                     self._x_prev[: self._particle_count],
                     self._A_diag_base[: self._particle_count],
                     include_body_contacts=self._contact is None,
+                    body_to_cable=self._cable.body_to_segment if self._cable is not None else None,
                 )
 
             self._A_diag.zero_()

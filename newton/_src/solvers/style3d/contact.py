@@ -47,9 +47,14 @@ def contact_response(
     dt: float,
 ) -> tuple[wp.vec3, wp.mat33, wp.vec3, wp.mat33]:
     """Return normal/friction gradients and PSD tangents for a penetrating contact."""
-    normal_gradient = ke * gap + kd * wp.min(vn, 0.0)
+    # Damp only the compression accrued while touching. With a frozen contact
+    # normal, max(vn, gap/dt) = (gap - min(previous_gap, 0))/dt.
+    # Using the full approach speed at first touch makes damping jump at gap=0,
+    # so Newton iterations can alternate forever between contact and separation.
+    closing_speed = wp.min(wp.max(vn, gap / dt), 0.0)
+    normal_gradient = ke * gap + kd * closing_speed
     normal_stiffness = ke
-    if vn < 0.0:
+    if closing_speed < 0.0:
         normal_stiffness += kd / dt
     Hn = normal_stiffness * wp.outer(n, n)
     gn = normal_gradient * n

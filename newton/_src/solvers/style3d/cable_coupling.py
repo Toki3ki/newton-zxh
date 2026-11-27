@@ -330,6 +330,108 @@ def eval_cable_coupling_kernel(
     tangents[tid] = t
 
 
+@wp.kernel
+def eval_particle_cable_contact_kernel(
+    dt: float,
+    particle_count: int,
+    node_start: int,
+    rotation_start: int,
+    body_to_segment: wp.array[int],
+    body_to_affine: wp.array[int],
+    segment_nodes: wp.array2d[int],
+    half_length: wp.array[float],
+    body_com: wp.array[wp.vec3],
+    body_q: wp.array[wp.transform],
+    body_qd: wp.array[wp.spatial_vector],
+    frame: wp.array[wp.mat33],
+    frame_begin: wp.array[wp.mat33],
+    x: wp.array[wp.vec3],
+    previous: wp.array[wp.vec3],
+    inertia: wp.array[wp.vec3],
+    flags: wp.array[int],
+    contact_count: wp.array[int],
+    contact_particle: wp.array[int],
+    contact_shape: wp.array[int],
+    contact_point: wp.array[wp.vec3],
+    contact_velocity: wp.array[wp.vec3],
+    normal: wp.array[wp.vec3],
+    shape_body: wp.array[int],
+    shape_margin: wp.array[float],
+    shape_mu: wp.array[float],
+    particle_radius: wp.array[float],
+    ke: float,
+    kd: float,
+    kf: float,
+    mu: float,
+    rhs: wp.array[wp.vec3],
+    diag: wp.array[wp.mat33],
+    tangents: wp.array[PointTangent],
+):
+    """Map particle/capsule contacts to particle, cable node and frame rows.
+
+    The relative point is p_particle - ((x_a+x_b)/2 + R r). Its Jacobian
+    includes the particle and both cable nodes plus the frame rotation.
+    Thus the same normal/friction energy produces equal opposite forces;
+    the frozen tangent is J^T H J in the shared linear system.
+    """
+    tid = wp.tid()
+    t = PointTangent()
+    tangents[tid] = t
+    if tid >= wp.min(contact_count[0], contact_particle.shape[0]):
+        return
+    particle = contact_particle[tid]
+    shape = contact_shape[tid]
+    if particle < 0 or particle >= particle_count or shape < 0:
+        return
+    body = shape_body[shape]
+    if body < 0:
+        return
+    segment = body_to_segment[body]
+    if segment < 0:
+        return
+    t.side0 = coupling_point(
+        body,
+        contact_point[tid],
+        False,
+        particle_count,
+        node_start,
+        rotation_start,
+        body_to_segment,
+        body_to_affine,
+        segment_nodes,
+        half_length,
+        body_com,
+        body_q,
+        body_qd,
+        frame,
+        frame_begin,
+        x,
+        previous,
+        inertia,
+        flags,
+        dt,
+    )
+    p = Point()
+    p.rows = wp.vec4i(particle, -1, -1, -1)
+    p.J0 = wp.identity(3, float)
+    p.current = x[particle]
+    p.previous = previous[particle]
+    t.side1 = p
+    n = normal[tid]
+    gap = wp.dot(n, p.current - t.side0.current) - particle_radius[particle] - shape_margin[shape]
+    if gap >= 0.0:
+        return
+    velocity = ((p.current - p.previous) - (t.side0.current - t.side0.previous)) / dt
+    velocity -= frame[segment] * contact_velocity[tid]
+    vn = wp.dot(n, velocity)
+    friction = wp.sqrt(wp.max(0.0, mu * shape_mu[shape]))
+    gn, Hn, gt, Ht = contact_response(gap, n, vn, velocity - vn * n, ke, kd, kf, friction, dt)
+    t.active = 1
+    t.hessian = Hn + Ht
+    assemble_point(t, gn + gt, rhs, diag)
+    tangents[tid] = t
+
+
 class CableCoupling:
     """Shared-system contacts and finite-stiffness BALL endpoint attachments."""
 
@@ -360,16 +462,20 @@ class CableCoupling:
         self.joints = wp.array(joints, dtype=int, device=model.device)
         self.attachments = wp.zeros(len(joints), dtype=PointTangent, device=model.device)
         self.contacts = wp.zeros(0, dtype=PointTangent, device=model.device)
+        self.soft_contacts = wp.zeros(0, dtype=PointTangent, device=model.device)
         self.empty_contacts = Contacts(0, 0, device=model.device)
 
     def evaluate(self, solver, state, contacts, dt):
         cable, model = self.cable, self.model
         if contacts is None:
             self.contacts.zero_()
+            self.soft_contacts.zero_()
             contacts = self.empty_contacts
             count = 0
         else:
             count = contacts.rigid_contact_max
+        if count == 0:
+            self.contacts.zero_()
         if count > len(self.contacts):
             self.contacts = wp.zeros(count, dtype=PointTangent, device=model.device)
         for attachment, tangents in ((False, self.contacts), (True, self.attachments)):
@@ -427,8 +533,53 @@ class CableCoupling:
                 device=model.device,
             )
 
+        if self.particle_count and contacts.soft_contact_max:
+            if contacts.soft_contact_max > len(self.soft_contacts):
+                self.soft_contacts = wp.zeros(contacts.soft_contact_max, dtype=PointTangent, device=model.device)
+            wp.launch(
+                eval_particle_cable_contact_kernel,
+                dim=len(self.soft_contacts),
+                inputs=[
+                    dt,
+                    self.particle_count,
+                    cable._position_start,
+                    cable._rotation_start,
+                    cable.body_to_segment,
+                    self.body_to_affine,
+                    cable._segment_nodes,
+                    cable._segment_half_length,
+                    model.body_com,
+                    state.body_q,
+                    state.body_qd,
+                    cable._frame,
+                    cable._frame_begin,
+                    solver._x,
+                    solver._x_prev,
+                    solver._x_inertia,
+                    solver._particle_flags,
+                    contacts.soft_contact_count,
+                    contacts.soft_contact_particle,
+                    contacts.soft_contact_shape,
+                    contacts.soft_contact_body_pos,
+                    contacts.soft_contact_body_vel,
+                    contacts.soft_contact_normal,
+                    model.shape_body,
+                    model.shape_margin,
+                    model.shape_material_mu,
+                    model.particle_radius,
+                    model.soft_contact_ke,
+                    model.soft_contact_kd,
+                    model.soft_contact_kf,
+                    model.soft_contact_mu,
+                ],
+                outputs=[solver._rhs, solver._A_diag, self.soft_contacts],
+                device=model.device,
+            )
+        else:
+            self.soft_contacts.zero_()
+
     def multiply(self, direction, product):
-        for tangents in (self.contacts, self.attachments):
+        for tangents in (self.contacts, self.attachments, self.soft_contacts):
             if len(tangents):
                 wp.launch(
                     point_off_diagonal_kernel,

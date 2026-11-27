@@ -67,6 +67,7 @@ def eval_body_contact_kernel(
     contact_body_vel: wp.array[wp.vec3],
     contact_normal: wp.array[wp.vec3],
     shape_margin: wp.array[float],
+    body_to_cable: wp.array[int],
     # outputs: particle force and hessian
     forces: wp.array[wp.vec3],
     hessians: wp.array[wp.mat33],
@@ -76,6 +77,10 @@ def eval_body_contact_kernel(
     particle_body_contact_count = wp.min(contact_max, contact_count[0])
 
     if t_id < particle_body_contact_count:
+        body = shape_body[contact_shape[t_id]]
+        if body >= 0 and body_to_cable.shape[0] > 0:
+            if body_to_cable[body] >= 0:
+                return
         particle_idx = soft_contact_particle[t_id]
         body_contact_force, body_contact_hessian = evaluate_body_particle_contact(
             particle_idx,
