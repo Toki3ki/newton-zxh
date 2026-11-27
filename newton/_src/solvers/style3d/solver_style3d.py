@@ -18,6 +18,8 @@ from ...sim import Contacts, Control, Model, ModelBuilder, State, StateFlags
 from ..solver import SolverBase
 from .affine_body import AffineBody
 from .builder import PDMatrixBuilder, _compute_max_neighbors
+from .cable import Cable
+from .cable_coupling import CableCoupling
 from .collision import Collision
 from .contact import Contact
 from .kernels import (
@@ -81,8 +83,10 @@ class SolverStyle3D(SolverBase):
     r"""Implicit solver for cloth, tetrahedral solids, and free rigid bodies using affine body dynamics.
 
     Select :attr:`Dynamics.DEFORMABLE` (the default), :attr:`Dynamics.AFFINE_BODY`,
-    or :attr:`Dynamics.ALL` to advance deformable particles, rigid bodies, or both together.
-    Joint constraints are not supported. See the :doc:`Style3D solver guide
+    :attr:`Dynamics.CABLE`, or :attr:`Dynamics.ALL` to advance particles, rigid
+    bodies, rod-backed cables, or their combination in the same system.
+    Cable endpoint BALL joints support finite-stiffness positional attachments;
+    other joint constraints are not supported. See the :doc:`Style3D solver guide
     </solvers/style3d>` for setup, rigidity, and contact parameters.
 
     With affine body dynamics enabled, rigid-rigid and particle-rigid contacts
@@ -181,7 +185,10 @@ class SolverStyle3D(SolverBase):
         AFFINE_BODY = 1 << 1
         """Advance rigid bodies using affine body dynamics."""
 
-        ALL = DEFORMABLE | AFFINE_BODY
+        CABLE = 1 << 2
+        """Advance rod-backed cables using VIPER dynamics."""
+
+        ALL = DEFORMABLE | AFFINE_BODY | CABLE
         """Enable all supported dynamics.
 
         Increase :attr:`Config.linear_iterations` as needed for coupled
@@ -229,21 +236,37 @@ class SolverStyle3D(SolverBase):
         enable_mouse_dragging: bool = False
         """Whether to enable the mouse-dragging kernel."""
 
-        use_initial_bend_curvature: bool = False
-        """Use the initial curvature magnitude as the cloth bending rest target.
+        cable_attachment_stiffness: float = 4000.0
+        """Finite positional stiffness [N/m] for BALL joints at cable endpoints."""
 
-        Experimental: enables a rotation-invariant, projective curvature energy
-        for curved shells such as tubes. The default retains flat-rest quadratic
-        bending. This preserves curvature magnitude, not its sign, and does not
-        impose a rigid or exactly circular cross-section. This is a runtime
-        solver option; no additional authored USD attribute is required.
-        """
+        cable_attachment_damping: float = 0.2
+        """Relative endpoint damping [N s/m] for cable BALL attachments."""
+
+        cable_stretch_stiffness: float = 1.0e4
+        """Axial rigidity ``EA`` [N] of VIPER cables. Zero disables stretch."""
+
+        cable_bend_stiffness: float = 1.0e-2
+        """Bending rigidity ``EI`` [N·m²] of VIPER cables. Zero disables bending."""
+
+        cable_twist_stiffness: float = 1.0e-2
+        """Torsional rigidity ``GJ`` [N·m²] of VIPER cables. Zero disables twist."""
+
+        cable_bend_yield_strain: float = 0.0
+        """Cable bend yield strain [rad]. Zero keeps bending elastic."""
+
+        cable_twist_yield_strain: float = 0.0
+        """Cable twist yield strain [rad]. Zero keeps twist elastic."""
+
+        cable_max_rotation_increment: float = 0.0
+        """Maximum Cable frame update per nonlinear iteration [rad]. Zero disables limiting."""
 
     config: Config
     """Live solver options, retained by reference when supplied at construction.
 
     Edit fields or replace this object with a :class:`Config` between calls
     to :meth:`step`. Captured CUDA graphs must be recaptured after changes.
+    Cable elastic rigidities and yield thresholds are read at construction;
+    rebuild the solver to change them. Cable integration is experimental.
     """
 
     @property
@@ -537,10 +560,25 @@ class SolverStyle3D(SolverBase):
 
         enable_deformable = bool(dynamics & SolverStyle3D.Dynamics.DEFORMABLE)
         enable_affine_body = bool(dynamics & SolverStyle3D.Dynamics.AFFINE_BODY)
+        enable_cable = bool(dynamics & SolverStyle3D.Dynamics.CABLE)
+
+        for name in (
+            "cable_stretch_stiffness",
+            "cable_bend_stiffness",
+            "cable_twist_stiffness",
+            "cable_bend_yield_strain",
+            "cable_twist_yield_strain",
+            "cable_max_rotation_increment",
+            "cable_attachment_stiffness",
+            "cable_attachment_damping",
+        ):
+            value = getattr(config, name)
+            if enable_cable and (not math.isfinite(value) or value < 0.0):
+                raise ValueError(f"Config.{name} must be finite and nonnegative.")
 
         self._attachment_count = model.attachment_particle_body_count if dynamics != self.Dynamics.NONE else 0
         if self._attachment_count:
-            if dynamics != self.Dynamics.ALL:
+            if not (enable_deformable and enable_affine_body):
                 raise ValueError("Style3D particle-body attachments require Dynamics.ALL.")
             stiffness = model.attachment_particle_body_stiffness.numpy()
             damping = model.attachment_particle_body_damping.numpy()
@@ -576,13 +614,68 @@ class SolverStyle3D(SolverBase):
                 ):
                     thresholds[start:end] = value
         self._tet_yield_strain = wp.array(thresholds, dtype=float, device=model.device)
+        # Cable segment bodies stay model objects for collision, rendering, and
+        # state interchange, but only the cable module advances them.
+        self._cable = (
+            Cable(
+                model,
+                stretch_stiffness=config.cable_stretch_stiffness,
+                bend_stiffness=config.cable_bend_stiffness,
+                twist_stiffness=config.cable_twist_stiffness,
+                bend_yield_strain=config.cable_bend_yield_strain,
+                twist_yield_strain=config.cable_twist_yield_strain,
+            )
+            if enable_cable and model.curve_count
+            else None
+        )
+        self._cable_body_segment = (
+            self._cable.body_to_segment
+            if self._cable is not None
+            else wp.full(model.body_count, -1, dtype=int, device=self.device)
+        )
+
+        # Cable segment bodies are proxy geometry, not ABD unknowns. Pack only
+        # ordinary Newton bodies into the affine solve range.
+        body_to_segment_np = self._cable_body_segment.numpy()
+        affine_bodies_np = (
+            np.flatnonzero(body_to_segment_np < 0).astype(np.int32)
+            if enable_affine_body
+            else np.zeros(0, dtype=np.int32)
+        )
+        body_to_affine_row_np = np.full(model.body_count, -1, dtype=np.int32)
+        body_to_affine_row_np[affine_bodies_np] = np.arange(affine_bodies_np.size, dtype=np.int32)
+        self._affine_bodies = wp.array(affine_bodies_np, dtype=int, device=self.device)
+        self._body_to_affine_row = wp.array(body_to_affine_row_np, dtype=int, device=self.device)
+
         # Number of DOF blocks in the linear system, with three scalar DOFs per block.
+        # Preserve the established particle/affine layout and append cable rows.
         self._particle_count = model.particle_count if enable_deformable else 0
-        self._affine_body_count = model.body_count if enable_affine_body else 0
-        self._dof_block_count = self._particle_count + self._affine_body_count * 4
-        self._affine_body = AffineBody(model) if enable_affine_body else None
+        self._affine_body_count = len(affine_bodies_np)
+        self._affine_body_end = self._particle_count + 4 * self._affine_body_count
+        self._cable_position_start = self._affine_body_end
+        self._cable_position_end = self._affine_body_end
+        self._cable_rotation_start = self._affine_body_end
+        self._cable_rotation_end = self._affine_body_end
+        self._dof_block_count = self._affine_body_end
+        if self._cable is not None:
+            self._cable_position_end = self._cable_position_start + self._cable.node_count
+            self._cable_rotation_start = self._cable_position_end
+            self._cable_rotation_end = self._cable_rotation_start + self._cable.segment_count
+            self._dof_block_count = self._cable_rotation_end
+        self._affine_body = AffineBody(model, self._affine_bodies) if enable_affine_body else None
         self._linear_solver = PcgSolver(self._dof_block_count, self.device)
-        self._contact = Contact(model, self._particle_count) if enable_affine_body else None
+        self._contact = (
+            Contact(
+                model,
+                self._particle_count,
+                self._body_to_affine_row,
+            )
+            if enable_affine_body
+            else None
+        )
+
+        if self._attachment_count and np.any(body_to_affine_row_np[model.attachment_particle_body_body.numpy()] < 0):
+            raise ValueError("Particle attachments to cable proxies are not supported.")
 
         # ParticleFlags for every particle and affine block, separate from model flags.
         self._particle_flags = wp.zeros(self._dof_block_count, dtype=int, device=self.device)
@@ -610,6 +703,28 @@ class SolverStyle3D(SolverBase):
         self._inv_A_diag = wp.zeros(self._dof_block_count, dtype=wp.mat33, device=self.device)
         # Matrix-free contribution to A x beyond the assembled base matrix.
         self._matrix_free_Ax = wp.zeros(self._dof_block_count, dtype=wp.vec3, device=self.device)
+
+        if self._cable is not None:
+            self._cable.bind_dofs(
+                position_start=self._cable_position_start,
+                position_end=self._cable_position_end,
+                rotation_start=self._cable_rotation_start,
+                rotation_end=self._cable_rotation_end,
+                x=self._x,
+                x_prev=self._x_prev,
+                x_inertia=self._x_inertia,
+                v=self._v,
+                dx=self._dx,
+                A_diag_base=self._A_diag_base,
+                pd_diag=self._pd_diag,
+                solver_flags=self._particle_flags,
+            )
+
+        self._cable_coupling = (
+            CableCoupling(model, self._cable, self._particle_count, self._body_to_affine_row)
+            if self._cable is not None and self._cable.node_count
+            else None
+        )
 
         # Drag info
         self._drag_pos = wp.zeros(1, dtype=wp.vec3, device=self.device)
@@ -644,6 +759,11 @@ class SolverStyle3D(SolverBase):
             raise ValueError("'state' argument is required.")
         world_mask = self._normalize_reset_world_mask(world_mask)
         flags_value = int(StateFlags.ALL if flags is None else flags)
+        if self._cable is not None and flags_value & int(StateFlags.BODY):
+            if world_mask is not None:
+                raise NotImplementedError("Partial-world cable reset is not supported.")
+            self._cable.reset(state)
+            self._cable._needs_sync = False
         if len(self._tet_volume_targets) and flags_value & int(StateFlags.PARTICLE):
             wp.launch(
                 reset_tet_volume_targets_kernel,
@@ -728,6 +848,7 @@ class SolverStyle3D(SolverBase):
             dim=self._particle_count + self._affine_body_count,
             inputs=[
                 self._particle_count,
+                self._affine_bodies,
                 dt,
                 self.model.gravity,
                 self.model.particle_world,
@@ -761,6 +882,9 @@ class SolverStyle3D(SolverBase):
                 device=self.device,
             )
 
+        if self._cable is not None:
+            self._cable.init_step(state_in, dt)
+
         plastic_rest_stretch = state_in.style3d.tet_plastic_rest_stretch if len(self._tet_yield_strain) else None
         for _iter in range(self.config.iterations):
             wp.launch(
@@ -771,6 +895,7 @@ class SolverStyle3D(SolverBase):
                     self._x,
                     self._x_inertia,
                     self._particle_count,
+                    self._affine_bodies,
                     self.model.particle_mass,
                     self.model.body_mass,
                     self.model.body_inertia,
@@ -779,6 +904,9 @@ class SolverStyle3D(SolverBase):
                 outputs=[self._rhs],
                 device=self.device,
             )
+
+            if self._cable is not None:
+                self._cable.init_rhs(dt, self._rhs[self._affine_body_end :])
 
             if self._particle_count > 0:
                 wp.launch(
@@ -804,8 +932,6 @@ class SolverStyle3D(SolverBase):
                         self._style3d_attr.edge_bending_cot,
                         self.model.edge_indices,
                         self.model.edge_bending_properties,
-                        self.model.particle_q,
-                        self.config.use_initial_bend_curvature,
                     ],
                     outputs=[self._rhs],
                     device=self.device,
@@ -857,27 +983,35 @@ class SolverStyle3D(SolverBase):
                     include_body_contacts=self._contact is None,
                 )
 
-            self._A_diag[: self._particle_count].zero_()
+            self._A_diag.zero_()
             if self._affine_body is not None:
                 self._affine_body.eval_orthogonality(
-                    self._x[self._particle_count :],
-                    self._rhs[self._particle_count :],
-                    self._A_diag[self._particle_count :],
+                    self._x[self._particle_count : self._affine_body_end],
+                    self._rhs[self._particle_count : self._affine_body_end],
+                    self._A_diag[self._particle_count : self._affine_body_end],
                     self.config.affine_rigidity_ratio,
                     dt,
+                )
+
+            if self._cable is not None:
+                self._cable.eval_cable_constraints(
+                    dt, self._rhs[self._affine_body_end :], self._A_diag[self._affine_body_end :]
                 )
 
             if self._contact is not None:
                 self._contact.eval_contacts(
                     contacts,
-                    self._x,
-                    self._x_prev,
-                    self._x_inertia,
-                    self._particle_flags,
-                    self._rhs,
-                    self._A_diag,
+                    self._x[: self._affine_body_end],
+                    self._x_prev[: self._affine_body_end],
+                    self._x_inertia[: self._affine_body_end],
+                    self._particle_flags[: self._affine_body_end],
+                    self._rhs[: self._affine_body_end],
+                    self._A_diag[: self._affine_body_end],
                     dt,
                 )
+
+            if self._cable_coupling is not None:
+                self._cable_coupling.evaluate(self, state_in, contacts, dt)
 
             if self._attachment_count:
                 wp.launch(
@@ -885,6 +1019,7 @@ class SolverStyle3D(SolverBase):
                     dim=self._attachment_count,
                     inputs=[
                         self._particle_count,
+                        self._body_to_affine_row,
                         self.model.attachment_particle_body_particle,
                         self.model.attachment_particle_body_body,
                         self.model.attachment_particle_body_body_point,
@@ -926,6 +1061,9 @@ class SolverStyle3D(SolverBase):
                 self._matrix_free_multiply,
             )
 
+            if self._cable is not None:
+                self._cable.stabilize_increment(self.config.cable_max_rotation_increment)
+
             if self.collision is not None:
                 self.collision.linear_iteration_end(self._dx[: self._particle_count])
 
@@ -937,9 +1075,12 @@ class SolverStyle3D(SolverBase):
                 device=self.device,
             )
 
+            if self._cable is not None:
+                self._cable.apply_increment()
+
         wp.launch(
             kernel=update_velocity_kernel,
-            dim=self._dof_block_count,
+            dim=self._cable_position_end,
             inputs=[dt, self._particle_count, self._x_prev, self._x],
             outputs=[self._v],
             device=self.device,
@@ -964,6 +1105,9 @@ class SolverStyle3D(SolverBase):
             self.collision.frame_end(particle_q, particle_qd, dt)
 
         self._from_internal_state(state_in, state_out, dt)
+        if self._cable is not None:
+            self._cable.update_plastic_strain()
+            self._cable._from_internal_state(state_out, dt)
 
     def _matrix_free_multiply(self, x: wp.array[wp.vec3]) -> wp.array[wp.vec3]:
         """Return the matrix-free contribution to A x, excluding the assembled base matrix."""
@@ -973,8 +1117,12 @@ class SolverStyle3D(SolverBase):
             self._matrix_free_Ax[: self._particle_count].zero_()
         if self._affine_body is not None:
             self._affine_body.off_diag_multiply(
-                x[self._particle_count :], self._affine_mass_off_diag, self._matrix_free_Ax[self._particle_count :]
+                x[self._particle_count : self._affine_body_end],
+                self._affine_mass_off_diag,
+                self._matrix_free_Ax[self._particle_count : self._affine_body_end],
             )
+        if self._cable is not None:
+            self._cable.matrix_free_multiply(x, self._matrix_free_Ax)
         if self._contact is not None:
             self._contact.off_diag_multiply(x, self._matrix_free_Ax)
         if self._attachment_count:
@@ -983,6 +1131,7 @@ class SolverStyle3D(SolverBase):
                 dim=self._attachment_count,
                 inputs=[
                     self._particle_count,
+                    self._body_to_affine_row,
                     self.model.attachment_particle_body_particle,
                     self.model.attachment_particle_body_body,
                     self.model.attachment_particle_body_body_point,
@@ -993,6 +1142,8 @@ class SolverStyle3D(SolverBase):
                 outputs=[self._matrix_free_Ax],
                 device=self.device,
             )
+        if self._cable_coupling is not None:
+            self._cable_coupling.multiply(x, self._matrix_free_Ax)
         return self._matrix_free_Ax
 
     def rebuild_bvh(self, state: State):
@@ -1101,12 +1252,15 @@ class SolverStyle3D(SolverBase):
                     matrix.add_stretch_constraints(tri_indices, tri_poses, tri_aniso_ke, tri_areas)
                     matrix.add_bend_constraints(edge_indices, edge_bending_properties, edge_rest_area, edge_bending_cot)
                     matrix.add_tet_constraints(tet_indices, tet_poses, tet_materials)
+                if self._cable is not None:
+                    self._cable.add_fixed_matrix(matrix, self._cable_position_start)
                 return matrix
 
             try:
                 pd_matrix_builder = assemble(32)
             except ValueError:
                 # Only overflowing meshes pay for counting surface and tetrahedral connections.
+                max_neighbors = 0
                 if self._particle_count > 0:
                     max_neighbors = _compute_max_neighbors(
                         self._dof_block_count,
@@ -1114,7 +1268,11 @@ class SolverStyle3D(SolverBase):
                         edge_indices,
                         tet_indices,
                     )
-                    pd_matrix_builder = assemble(max_neighbors)
+                if self._cable is not None:
+                    max_neighbors = max(max_neighbors, self._cable.max_matrix_neighbors())
+                if max_neighbors <= 32:
+                    raise
+                pd_matrix_builder = assemble(max_neighbors)
             self._pd_diag, self._pd_off_diag.num_nz, self._pd_off_diag.nz_ell = pd_matrix_builder.finalize(self.device)
 
     def _to_internal_state(self, state: State, dt: float):
@@ -1128,6 +1286,7 @@ class SolverStyle3D(SolverBase):
                 dim=self._particle_count + self._affine_body_count,
                 inputs=[
                     self._particle_count,
+                    self._affine_bodies,
                     self.model.particle_mass,
                     self.model.particle_flags,
                     self.model.body_mass,
@@ -1138,7 +1297,10 @@ class SolverStyle3D(SolverBase):
             )
         if self._affine_body_count > 0:
             self._affine_body.to_internal_state(
-                state, self._x[self._particle_count :], self._x_inertia[self._particle_count :], dt
+                state,
+                self._x[self._particle_count : self._affine_body_end],
+                self._x_inertia[self._particle_count : self._affine_body_end],
+                dt,
             )
 
     def _from_internal_state(self, state_in: State, state_out: State, dt: float):
@@ -1148,7 +1310,11 @@ class SolverStyle3D(SolverBase):
             wp.copy(state_out.particle_qd, self._v, count=self._particle_count)
         if self._affine_body_count > 0:
             self._affine_body.from_internal_state(
-                state_in, state_out, self._x[self._particle_count :], self._v[self._particle_count :], dt
+                state_in,
+                state_out,
+                self._x[self._particle_count : self._affine_body_end],
+                self._v[self._particle_count : self._affine_body_end],
+                dt,
             )
 
     def _update_drag_info(self, index: int, pos: wp.vec3, bary_coord: wp.vec3):

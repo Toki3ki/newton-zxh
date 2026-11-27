@@ -12,6 +12,7 @@ from .affine_body import affine_mass_multiply, inertia_to_second_moment
 @wp.kernel
 def eval_particle_body_attachment_kernel(
     particle_count: int,
+    body_to_affine_row: wp.array[int],
     particles: wp.array[int],
     bodies: wp.array[int],
     points: wp.array[wp.vec3],
@@ -69,7 +70,7 @@ def eval_particle_body_attachment_kernel(
         return
     particle = particles[tid]
     body = bodies[tid]
-    start = particle_count + 4 * body
+    start = particle_count + 4 * body_to_affine_row[body]
     local = points[tid] - body_com[body]
     weights = wp.vec4(1.0, local[0], local[1], local[2])
     residual = x[particle]
@@ -95,6 +96,7 @@ def eval_particle_body_attachment_kernel(
 @wp.kernel
 def particle_body_attachment_off_diag_multiply_kernel(
     particle_count: int,
+    body_to_affine_row: wp.array[int],
     particles: wp.array[int],
     bodies: wp.array[int],
     points: wp.array[wp.vec3],
@@ -124,7 +126,7 @@ def particle_body_attachment_off_diag_multiply_kernel(
         return
     particle = particles[tid]
     body = bodies[tid]
-    start = particle_count + 4 * body
+    start = particle_count + 4 * body_to_affine_row[body]
     local = points[tid] - body_com[body]
     weights = wp.vec4(1.0, local[0], local[1], local[2])
     point = wp.vec3(0.0)
@@ -159,6 +161,7 @@ def reset_tet_volume_targets_kernel(
 @wp.kernel
 def compute_solver_flags_kernel(
     particle_count: int,
+    affine_bodies: wp.array[int],
     particle_masses: wp.array[float],
     particle_flags: wp.array[wp.int32],
     body_masses: wp.array[float],
@@ -175,7 +178,8 @@ def compute_solver_flags_kernel(
         solver_flags[tid] = flags
     else:
         flags = wp.int32(0)
-        body = tid - particle_count
+        affine_row = tid - particle_count
+        body = affine_bodies[affine_row]
         source_flags = body_flags[body]
         if (
             body_masses[body] > 0.0
@@ -187,7 +191,7 @@ def compute_solver_flags_kernel(
         if (source_flags & BodyFlags.PROXY) != 0:
             flags = flags | ParticleFlags.PROXY
 
-        start = particle_count + 4 * body
+        start = particle_count + 4 * affine_row
         solver_flags[start + 0] = flags
         solver_flags[start + 1] = flags
         solver_flags[start + 2] = flags
@@ -424,8 +428,6 @@ def eval_bend_kernel(
     edge_bending_cot: wp.array[wp.vec4],
     edges: wp.array2d[wp.int32],
     edge_bending_properties: wp.array2d[float],
-    rest_pos: wp.array[wp.vec3],
-    use_initial_curvature: bool,
     # outputs
     forces: wp.array[wp.vec3],
 ):
@@ -444,16 +446,6 @@ def eval_bend_kernel(
     from rest-pose cotangents. The conservative force is
 
         F_i = -dE_b/dx_i = -k * sum_j Q_ij x_j.
-
-    With initial curvature enabled, let c = sum_i w_i x_i and
-    r = ||sum_i w_i X_i|| for the initial positions X. Use
-
-        E_b = 1/2 * k * 3/(A0 + A1) * (||c|| - r)^2,
-        p = r * c/||c||,
-        F_i = -k * 3/(A0 + A1) * w_i * (c - p).
-
-    Holding the rotation-invariant local projection p fixed leaves the existing
-    positive semidefinite PD matrix unchanged. At c = 0 use the zero subgradient.
     """
     eid = wp.tid()
     if edges[eid][0] < 0 or edges[eid][1] < 0:
@@ -467,18 +459,11 @@ def eval_bend_kernel(
     bend_weight[3] = edge_bending_cot[eid][0] + edge_bending_cot[eid][1]
     bend_weight[0] = -edge_bending_cot[eid][0] - edge_bending_cot[eid][2]
     bend_weight[1] = -edge_bending_cot[eid][1] - edge_bending_cot[eid][3]
-    curvature = wp.vec3(0.0)
-    rest_curvature = wp.vec3(0.0)
-    # Relative coordinates avoid cancellation for small shells far from origin.
-    for j in range(3):
-        curvature += bend_weight[j] * (pos[edge[j]] - pos[edge[3]])
-        if use_initial_curvature:
-            rest_curvature += bend_weight[j] * (rest_pos[edge[j]] - rest_pos[edge[3]])
-    residual = curvature
-    if use_initial_curvature and wp.length(curvature) > 1.0e-12:
-        residual -= wp.length(rest_curvature) * wp.normalize(curvature)
     for i in range(4):
-        wp.atomic_sub(forces, edge[i], edge_stiff * bend_weight[i] * residual)
+        force = wp.vec3(0.0)
+        for j in range(4):
+            force = force - edge_stiff * bend_weight[i] * bend_weight[j] * pos[edge[j]]
+        wp.atomic_add(forces, edge[i], force)
 
 
 @wp.kernel
@@ -544,6 +529,7 @@ def accumulate_dragging_pd_diag_kernel(
 @wp.kernel
 def init_step_kernel(
     particle_count: int,
+    affine_bodies: wp.array[int],
     dt: float,
     gravity: wp.array[wp.vec3],
     particle_world: wp.array[wp.int32],
@@ -589,8 +575,9 @@ def init_step_kernel(
             x_curr[tid] = x_inertia[tid]
             dx[tid] = wp.vec3(0.0)
     else:
-        body = tid - particle_count
-        start = particle_count + 4 * body
+        affine_row = tid - particle_count
+        body = affine_bodies[affine_row]
+        start = particle_count + 4 * affine_row
         is_kinematic = (body_flags[body] & BodyFlags.KINEMATIC) != 0
         active = body_mass[body] > 0.0 and (is_kinematic or (body_flags[body] & BodyFlags.DYNAMIC) != 0)
         mass = float(0.0)
@@ -600,7 +587,7 @@ def init_step_kernel(
             moment = inertia_to_second_moment(body_inertia[body]) / (dt * dt)
 
         # Cache the symmetric mass coupling once per step for all PCG products.
-        affine_mass_off_diag[body] = wp.vec3(moment[0, 1], moment[0, 2], moment[1, 2])
+        affine_mass_off_diag[affine_row] = wp.vec3(moment[0, 1], moment[0, 2], moment[1, 2])
 
         for i in range(4):
             row = start + i
@@ -622,6 +609,7 @@ def init_rhs_kernel(
     x_curr: wp.array[wp.vec3],
     x_inertia: wp.array[wp.vec3],
     particle_count: int,
+    affine_bodies: wp.array[int],
     particle_masses: wp.array[float],
     body_mass: wp.array[float],
     body_inertia: wp.array[wp.mat33],
@@ -636,8 +624,9 @@ def init_rhs_kernel(
         rhs[tid] = (x_inertia[tid] - x_curr[tid]) * particle_masses[tid] / (dt * dt)
         return
 
-    body = tid - particle_count
-    start = particle_count + 4 * body
+    affine_row = tid - particle_count
+    body = affine_bodies[affine_row]
+    start = particle_count + 4 * affine_row
     if body_mass[body] <= 0.0 or (
         (body_flags[body] & BodyFlags.DYNAMIC) == 0 and (body_flags[body] & BodyFlags.KINEMATIC) == 0
     ):
@@ -721,3 +710,560 @@ def update_velocity_kernel(
         vel[tid] = 0.998 * (pos[tid] - prev_pos[tid]) / dt
     else:
         vel[tid] = (pos[tid] - prev_pos[tid]) / dt
+
+
+########################################################################################################################
+###############################################    VIPER cable kernels    ##############################################
+########################################################################################################################
+
+# The cable module binds a contiguous slice of the shared solver buffers that
+# holds its center rows first, followed by one rotation-tangent row per segment.
+# Every kernel below therefore addresses node ``i`` directly and segment ``e`` at
+# ``node_count + e``, without inferring one range from the other.
+
+
+@wp.func
+def cable_rotation_exp(delta: wp.vec3) -> wp.mat33:
+    """Map a rotation vector onto SO(3) with the matrix exponential."""
+    angle = wp.length(delta)
+    if angle < 1.0e-8:
+        # First-order expansion, reusing the skew matrix of the rotation vector.
+        return wp.mat33(
+            1.0,
+            -delta[2],
+            delta[1],
+            delta[2],
+            1.0,
+            -delta[0],
+            -delta[1],
+            delta[0],
+            1.0,
+        )
+    return wp.quat_to_matrix(wp.quat_from_axis_angle(delta / angle, angle))
+
+
+@wp.func
+def cable_rotation_log(rotation: wp.mat33) -> wp.vec3:
+    """Map a rotation matrix to its principal rotation vector."""
+    quat = wp.normalize(wp.quat_from_matrix(rotation))
+    if quat[3] < 0.0:
+        quat = -quat
+    vector = wp.vec3(quat[0], quat[1], quat[2])
+    sine = wp.length(vector)
+    if sine < 1.0e-8:
+        # Half-angle approximation: vector ~ axis * angle / 2.
+        return vector * 2.0
+    return vector * (2.0 * wp.atan2(sine, quat[3]) / sine)
+
+
+@wp.kernel
+def cable_collect_state_kernel(
+    segment_nodes: wp.array2d[int],
+    segment_bodies: wp.array[int],
+    segment_com: wp.array[wp.vec3],
+    segment_half_length: wp.array[float],
+    body_q: wp.array[wp.transform],
+    body_qd: wp.array[wp.spatial_vector],
+    # outputs
+    node_position_sum: wp.array[wp.vec3],
+    node_velocity_sum: wp.array[wp.vec3],
+    node_multiple: wp.array[int],
+    frame: wp.array[wp.mat33],
+    frame_velocity: wp.array[wp.vec3],
+):
+    """Convert Newton segment poses into Style3D VIPER node/frame state.
+
+    ``ModelBuilder.add_rod`` represents every rod edge as one capsule body. In
+    contrast, the VIPER solve uses one position at every discrete rod node
+    (a segment endpoint, shared by adjacent segments) and one material frame per
+    segment. These node positions are not capsule-center positions.
+    ``Cable._allocate_topology`` has already
+    converted the ROD-joint connectivity into ``segment_bodies`` and
+    ``segment_nodes`` before this kernel runs. For a two-segment open chain the
+    mapping is
+
+    .. code-block:: text
+
+        VIPER nodes:       x0 o----------o x1 ----------o x2
+        segment bodies:          body 0          body 1
+        material frames:           R0              R1
+
+    For segment ``e`` with body pose ``(p_e, q_e)``, body-local center-of-mass
+    offset ``com_e``, and capsule half-length ``h_e``, this kernel samples
+
+    .. code-block:: text
+
+        R_e       = matrix(q_e)
+        x_e^-     = transform(pose_e, com_e + (0, 0, -h_e))
+        x_e^+     = transform(pose_e, com_e + (0, 0,  h_e))
+
+    Thus, for the common COM-origin convention, ``p_e`` is the segment center
+    and the two samples reduce to ``p_e +/- R_e (0, 0, h_e)``. The topology
+    table ``segment_nodes[e]`` sends these samples to the two global VIPER node
+    rows. At an interior vertex, the adjacent segments both sample the same
+    logical node; :func:`cable_average_state_kernel` averages those samples into
+    the single node position used by the solve.
+
+    This kernel only evaluates the current values for the previously allocated
+    mapping; it neither creates topology nor evaluates elastic constraints. Newton
+    keeps the capsule poses for collision, rendering, and state interchange,
+    while the Style3D cable advances the reconstructed node positions and
+    material frames.
+    """
+    e = wp.tid()
+    body = segment_bodies[e]
+    pose = body_q[body]
+    half_length = segment_half_length[e]
+    com = segment_com[e]
+    # Reconstruct the two centerline vertices represented by this capsule body:
+    #
+    #   start o----------[ body pose / segment center ]----------o end
+    #                       material frame R_e
+    #
+    # ``com`` keeps this expression valid for both COM-origin and legacy
+    # start-origin rod bodies.
+    start = wp.transform_point(pose, com + wp.vec3(0.0, 0.0, -half_length))
+    end = wp.transform_point(pose, com + wp.vec3(0.0, 0.0, half_length))
+    node_start = segment_nodes[e, 0]
+    node_end = segment_nodes[e, 1]
+    wp.atomic_add(node_position_sum, node_start, start)
+    wp.atomic_add(node_position_sum, node_end, end)
+    wp.atomic_add(node_multiple, node_start, 1)
+    wp.atomic_add(node_multiple, node_end, 1)
+
+    velocity = wp.spatial_top(body_qd[body])
+    wp.atomic_add(node_velocity_sum, node_start, velocity)
+    wp.atomic_add(node_velocity_sum, node_end, velocity)
+
+    # The body quaternion is only the Newton state representation. VIPER keeps
+    # the equivalent SO(3) material frame and solves a vec3 tangent increment.
+    frame[e] = wp.quat_to_matrix(wp.transform_get_rotation(pose))
+    frame_velocity[e] = wp.spatial_bottom(body_qd[body])
+
+
+@wp.kernel
+def cable_average_state_kernel(
+    node_multiple: wp.array[int],
+    node_position_sum: wp.array[wp.vec3],
+    node_velocity_sum: wp.array[wp.vec3],
+    # outputs
+    node_position: wp.array[wp.vec3],
+    node_velocity: wp.array[wp.vec3],
+):
+    """Average ``end_previous`` and ``start_next`` to remove small gaps at a shared VIPER rod node."""
+    tid = wp.tid()
+    multiple = node_multiple[tid]
+    if multiple == 0:
+        node_position[tid] = wp.vec3(0.0)
+        node_velocity[tid] = wp.vec3(0.0)
+        return
+    scale = 1.0 / float(multiple)
+    # Interior example: x_i = (end_previous + start_next) / 2.
+    node_position[tid] = node_position_sum[tid] * scale
+    node_velocity[tid] = node_velocity_sum[tid] * scale
+
+
+@wp.kernel
+def cable_node_begin_kernel(
+    dt: float,
+    node_mass: wp.array[float],
+    node_world: wp.array[int],
+    gravity: wp.array[wp.vec3],
+    pd_diag: wp.array[float],
+    node_position: wp.array[wp.vec3],
+    node_velocity: wp.array[wp.vec3],
+    # outputs
+    node_previous: wp.array[wp.vec3],
+    node_inertia: wp.array[wp.vec3],
+    dx: wp.array[wp.vec3],
+    A_diag_base: wp.array[float],
+    solver_flags: wp.array[int],
+):
+    """Predict VIPER center positions for the whole cable solve."""
+    tid = wp.tid()
+    node_previous[tid] = node_position[tid]
+    mass = node_mass[tid]
+    if mass <= 0.0:
+        node_velocity[tid] = wp.vec3(0.0)
+        node_inertia[tid] = node_position[tid]
+        dx[tid] = wp.vec3(0.0)
+        A_diag_base[tid] = 0.0
+        solver_flags[tid] = 0
+        return
+    solver_flags[tid] = ParticleFlags.ACTIVE
+    A_diag_base[tid] = pd_diag[tid] + mass / (dt * dt)
+    node_inertia[tid] = node_position[tid] + node_velocity[tid] * dt + gravity[node_world[tid]] * (dt * dt)
+    # Warm-start the first PCG solve with the unconstrained inertial motion.
+    # A uniform translation lies in the null space of the elastic rod energies,
+    # so gravity should not need to propagate along a stiff cable through PCG.
+    dx[tid] = node_inertia[tid] - node_position[tid]
+
+
+@wp.func
+def cable_segment_frame_is_prescribed(mass: float, flags: int) -> bool:
+    """Return whether an external driver owns a segment's material frame.
+
+    A zero-mass or kinematic segment is prescribed, mirroring how the affine
+    solve treats externally driven bodies.
+    """
+    return mass <= 0.0 or (flags & BodyFlags.KINEMATIC) != 0
+
+
+@wp.kernel
+def cable_segment_begin_kernel(
+    dt: float,
+    frame_inertia: wp.array[float],
+    frame_velocity: wp.array[wp.vec3],
+    pd_diag: wp.array[float],
+    segment_bodies: wp.array[int],
+    body_q: wp.array[wp.transform],
+    body_mass: wp.array[float],
+    body_flags: wp.array[int],
+    frame: wp.array[wp.mat33],
+    # outputs
+    frame_begin: wp.array[wp.mat33],
+    tangent: wp.array[wp.vec3],
+    tangent_previous: wp.array[wp.vec3],
+    tangent_velocity: wp.array[wp.vec3],
+    tangent_inertia: wp.array[wp.vec3],
+    dx: wp.array[wp.vec3],
+    A_diag_base: wp.array[float],
+    solver_flags: wp.array[int],
+):
+    """Anchor the material frames and predict their tangent-space targets.
+
+    Rotation rows hold the world-frame tangent increment accumulated since
+    ``frame_begin``, so the inertial target of a constant angular velocity is
+    simply ``omega * dt``. A prescribed segment takes its frame from the input
+    state and keeps no rotation row, so the driver owns both its orientation and
+    its angular velocity.
+    """
+    e = wp.tid()
+    body = segment_bodies[e]
+    if cable_segment_frame_is_prescribed(body_mass[body], body_flags[body]):
+        frame[e] = wp.quat_to_matrix(wp.transform_get_rotation(body_q[body]))
+        frame_begin[e] = frame[e]
+        tangent[e] = wp.vec3(0.0)
+        tangent_previous[e] = wp.vec3(0.0)
+        tangent_velocity[e] = wp.vec3(0.0)
+        tangent_inertia[e] = wp.vec3(0.0)
+        dx[e] = wp.vec3(0.0)
+        A_diag_base[e] = 0.0
+        solver_flags[e] = 0
+        return
+    frame_begin[e] = frame[e]
+    tangent[e] = wp.vec3(0.0)
+    tangent_previous[e] = wp.vec3(0.0)
+    tangent_velocity[e] = wp.vec3(0.0)
+    dx[e] = wp.vec3(0.0)
+    inertia = frame_inertia[e]
+    if inertia <= 0.0:
+        tangent_inertia[e] = wp.vec3(0.0)
+        A_diag_base[e] = 0.0
+        solver_flags[e] = 0
+        return
+    solver_flags[e] = ParticleFlags.ACTIVE
+    A_diag_base[e] = pd_diag[e] + inertia / (dt * dt)
+    tangent_inertia[e] = frame_velocity[e] * dt
+
+
+@wp.kernel
+def cable_node_inertia_kernel(
+    dt: float,
+    node_mass: wp.array[float],
+    node_position: wp.array[wp.vec3],
+    node_inertia: wp.array[wp.vec3],
+    # outputs
+    rhs: wp.array[wp.vec3],
+):
+    """Initialize M (x_inertia - x) / dt^2 for VIPER centers."""
+    tid = wp.tid()
+    rhs[tid] = (node_inertia[tid] - node_position[tid]) * (node_mass[tid] / (dt * dt))
+
+
+@wp.kernel
+def cable_external_force_kernel(
+    dt: float,
+    segment_bodies: wp.array[int],
+    segment_nodes: wp.array2d[int],
+    node_mass: wp.array[float],
+    frame_inertia: wp.array[float],
+    rotation_flags: wp.array[int],
+    body_f: wp.array[wp.spatial_vector],
+    node_inertia: wp.array[wp.vec3],
+    node_dx: wp.array[wp.vec3],
+    tangent_inertia: wp.array[wp.vec3],
+):
+    """Map external COM forces and torques, including picking, to VIPER inertia."""
+    e = wp.tid()
+    wrench = body_f[segment_bodies[e]]
+    for side in range(2):
+        node = segment_nodes[e, side]
+        if node_mass[node] > 0.0:
+            increment = 0.5 * dt * dt / node_mass[node] * wp.spatial_top(wrench)
+            wp.atomic_add(node_inertia, node, increment)
+            wp.atomic_add(node_dx, node, increment)
+    if rotation_flags[e] & ParticleFlags.ACTIVE and frame_inertia[e] > 0.0:
+        tangent_inertia[e] += dt * dt / frame_inertia[e] * wp.spatial_bottom(wrench)
+
+
+@wp.kernel
+def cable_segment_inertia_kernel(
+    dt: float,
+    frame_inertia: wp.array[float],
+    tangent: wp.array[wp.vec3],
+    tangent_inertia: wp.array[wp.vec3],
+    # outputs
+    rhs: wp.array[wp.vec3],
+):
+    """Initialize J (theta_inertia - theta) / dt^2 for material frames."""
+    e = wp.tid()
+    rhs[e] = (tangent_inertia[e] - tangent[e]) * (frame_inertia[e] / (dt * dt))
+
+
+@wp.kernel
+def cable_eval_stretch_kernel(
+    segment_nodes: wp.array2d[int],
+    rest_length: wp.array[float],
+    stretch_stiffness: wp.array[float],
+    frame: wp.array[wp.mat33],
+    node_position: wp.array[wp.vec3],
+    # outputs
+    rhs_node: wp.array[wp.vec3],
+    rhs_rotation: wp.array[wp.vec3],
+    diag_rotation: wp.array[wp.mat33],
+    frame_edge: wp.array[wp.vec3],
+):
+    """Accumulate the stretch/alignment force and its frozen rotation tangent.
+
+    With the material frame frozen, the energy is quadratic in the endpoint
+    centers, so its position Hessian is the constant ``k [I3, -I3; -I3, I3]``
+    stencil assembled into the fixed PD matrix. This kernel only adds the force
+    and the frame tangent blocks that the fixed matrix cannot represent.
+    """
+    e = wp.tid()
+    start = segment_nodes[e, 0]
+    end = segment_nodes[e, 1]
+    rest_edge = frame[e] * wp.vec3(0.0, 0.0, rest_length[e])
+    residual = (node_position[end] - node_position[start]) - rest_edge
+    stiffness = stretch_stiffness[e]
+    force = stiffness * residual
+    wp.atomic_add(rhs_node, start, force)
+    wp.atomic_add(rhs_node, end, -force)
+    wp.atomic_add(rhs_rotation, e, stiffness * wp.cross(rest_edge, residual))
+    wp.atomic_add(
+        diag_rotation,
+        e,
+        stiffness * (wp.dot(rest_edge, rest_edge) * wp.identity(3, float) - wp.outer(rest_edge, rest_edge)),
+    )
+    frame_edge[e] = rest_edge
+
+
+@wp.kernel
+def cable_stretch_matrix_free_kernel(
+    segment_nodes: wp.array2d[int],
+    stretch_stiffness: wp.array[float],
+    frame_edge: wp.array[wp.vec3],
+    direction_node: wp.array[wp.vec3],
+    direction_rotation: wp.array[wp.vec3],
+    # outputs
+    product_node: wp.array[wp.vec3],
+    product_rotation: wp.array[wp.vec3],
+):
+    """Add the position-rotation stretch coupling and its transpose to ``A * d``."""
+    e = wp.tid()
+    start = segment_nodes[e, 0]
+    end = segment_nodes[e, 1]
+    stiffness = stretch_stiffness[e]
+    edge = frame_edge[e]
+    coupling = stiffness * wp.cross(edge, direction_rotation[e])
+    wp.atomic_add(product_node, start, -coupling)
+    wp.atomic_add(product_node, end, coupling)
+    relative = direction_node[end] - direction_node[start]
+    wp.atomic_add(product_rotation, e, stiffness * wp.cross(relative, edge))
+
+
+@wp.kernel
+def cable_eval_darboux_kernel(
+    pairs: wp.array2d[int],
+    rest_rotation: wp.array[wp.quat],
+    plastic_strain: wp.array[wp.vec3],
+    weights: wp.array[wp.vec3],
+    frame: wp.array[wp.mat33],
+    rhs: wp.array[wp.vec3],
+    diagonal: wp.array[wp.mat33],
+    off_diagonal: wp.array[wp.mat33],
+):
+    r"""Linearize VIPER's elastic Darboux strain for fixed local plasticity.
+
+    The relative error is ``q_err = inverse(q_rest) * conj(q0) * q1`` and the
+    residual is ``e = 2 Im(q_err) - plastic_strain``. The
+    site energy is ``E = 1/2 e^T diag(weights) e``. With plastic strain fixed,
+    this contributes ``b = -J^T K e`` and the PSD Gauss-Newton block
+    ``A = J^T K J`` to the global solve.
+
+    The dual length is absorbed into weights = (EI, EI, GJ) / Ldual. Both
+    frames use world-space left increments. Their Jacobians are opposite,
+    preserving rigid rotation invariance and a symmetric PSD frozen operator.
+    """
+    i = wp.tid()
+    a = pairs[i, 0]
+    b = pairs[i, 1]
+    q_relative = wp.normalize(wp.quat_from_matrix(wp.transpose(frame[a]) * frame[b]))
+    q_rest = rest_rotation[i]
+    q = wp.normalize(wp.quat_inverse(q_rest) * q_relative)
+    if q[3] < 0.0:
+        q = -q
+    v = wp.vec3(q[0], q[1], q[2])
+    # Plastic curvature is a local reference shift; it stays fixed during the
+    # global solve, so the elastic energy remains quadratic in this residual.
+    residual = 2.0 * v - plastic_strain[i]
+    jac = (q[3] * wp.identity(3, float) - wp.skew(v)) * wp.transpose(wp.quat_to_matrix(q_rest)) * wp.transpose(frame[a])
+    weighted = wp.diag(weights[i])
+    force = wp.transpose(jac) * (weighted * residual)
+    block = wp.transpose(jac) * weighted * jac
+    wp.atomic_add(rhs, a, force)
+    wp.atomic_add(rhs, b, -force)
+    wp.atomic_add(diagonal, a, block)
+    wp.atomic_add(diagonal, b, block)
+    off_diagonal[i] = -block
+
+
+# Plastic return mapping is local: the global solve sees only a fixed plastic
+# reference strain, while this kernel updates that reference after convergence.
+@wp.kernel
+def cable_update_plastic_strain_kernel(
+    pairs: wp.array2d[int],
+    rest_rotation: wp.array[wp.quat],
+    frame: wp.array[wp.mat33],
+    plastic_strain: wp.array[wp.vec3],
+    bend_yield: float,
+    twist_yield: float,
+):
+    r"""Apply perfect-plastic return mapping to one converged Darboux site.
+
+    The trial elastic strain and moment are::
+
+        e_trial = kappa - kappa_rest - kappa_p
+        m_trial = K e_trial
+
+    Bend uses a circular yield surface in its two material-plane components.
+    If ``||e_b|| > bend_yield``, radial return adds
+    ``(1 - bend_yield/||e_b||) e_b`` to plastic bend. Twist uses an independent
+    one-dimensional yield interval and adds the excess signed strain to
+    ``kappa_p``. Equivalently, each update projects elastic strain onto its
+    yield surface, capping bend/twist moment at ``K * yield_strain``.
+
+    The caller runs this once after the global nonlinear solve, never inside
+    PCG or a nonlinear iteration.
+    """
+    i = wp.tid()
+    a = pairs[i, 0]
+    b = pairs[i, 1]
+    q_relative = wp.normalize(wp.quat_from_matrix(wp.transpose(frame[a]) * frame[b]))
+    q = wp.normalize(wp.quat_inverse(rest_rotation[i]) * q_relative)
+    if q[3] < 0.0:
+        q = -q
+    elastic = 2.0 * wp.vec3(q[0], q[1], q[2]) - plastic_strain[i]
+    updated = plastic_strain[i]
+
+    bend_norm = wp.sqrt(elastic[0] * elastic[0] + elastic[1] * elastic[1])
+    if bend_yield > 0.0 and bend_norm > bend_yield:
+        scale = 1.0 - bend_yield / bend_norm
+        updated = updated + wp.vec3(scale * elastic[0], scale * elastic[1], 0.0)
+
+    if twist_yield > 0.0 and wp.abs(elastic[2]) > twist_yield:
+        excess = wp.abs(elastic[2]) - twist_yield
+        sign = 1.0 if elastic[2] > 0.0 else -1.0
+        updated = updated + wp.vec3(0.0, 0.0, sign * excess)
+
+    plastic_strain[i] = updated
+
+
+@wp.kernel
+def cable_darboux_matrix_free_kernel(
+    pairs: wp.array2d[int],
+    off_diagonal: wp.array[wp.mat33],
+    direction: wp.array[wp.vec3],
+    product: wp.array[wp.vec3],
+):
+    """Apply both off-diagonal blocks of the frozen Darboux operator."""
+    i = wp.tid()
+    a = pairs[i, 0]
+    b = pairs[i, 1]
+    block = off_diagonal[i]
+    wp.atomic_add(product, a, block * direction[b])
+    wp.atomic_add(product, b, wp.transpose(block) * direction[a])
+
+
+@wp.kernel
+def cable_apply_increment_kernel(
+    frame_begin: wp.array[wp.mat33],
+    tangent: wp.array[wp.vec3],
+    # outputs
+    frame: wp.array[wp.mat33],
+):
+    """Retract the accumulated tangent increment onto the material frames."""
+    e = wp.tid()
+    frame[e] = cable_rotation_exp(tangent[e]) * frame_begin[e]
+
+
+@wp.kernel
+def cable_measure_increment_scale_kernel(
+    max_angle: float,
+    rotation_increment: wp.array[wp.vec3],
+    scale: wp.array[float],
+):
+    r"""Find ``alpha=min(1, theta_max/max_e|Delta theta_e|)`` for this step."""
+    e = wp.tid()
+    angle = wp.length(rotation_increment[e])
+    if angle > max_angle:
+        wp.atomic_min(scale, 0, max_angle / angle)
+
+
+@wp.kernel
+def cable_scale_increment_kernel(
+    scale: wp.array[float],
+    increment: wp.array[wp.vec3],
+):
+    r"""Apply ``Delta x_cable <- alpha Delta x_cable`` to coupled increments."""
+    i = wp.tid()
+    increment[i] = scale[0] * increment[i]
+
+
+@wp.kernel
+def cable_writeback_kernel(
+    dt: float,
+    segment_nodes: wp.array2d[int],
+    segment_bodies: wp.array[int],
+    segment_com: wp.array[wp.vec3],
+    body_mass: wp.array[float],
+    body_flags: wp.array[int],
+    node_position: wp.array[wp.vec3],
+    node_previous: wp.array[wp.vec3],
+    frame: wp.array[wp.mat33],
+    frame_begin: wp.array[wp.mat33],
+    # outputs
+    body_q: wp.array[wp.transform],
+    body_qd: wp.array[wp.spatial_vector],
+    frame_velocity: wp.array[wp.vec3],
+):
+    """Reconstruct each proxy capsule from its two nodes and its material frame.
+
+    Prescribed segments are left untouched: an external driver owns their pose
+    and velocity, exactly as for externally driven affine bodies.
+    """
+    e = wp.tid()
+    body = segment_bodies[e]
+    if cable_segment_frame_is_prescribed(body_mass[body], body_flags[body]):
+        return
+    start = segment_nodes[e, 0]
+    end = segment_nodes[e, 1]
+    rotation = frame[e]
+    center = 0.5 * (node_position[start] + node_position[end])
+    previous_center = 0.5 * (node_previous[start] + node_previous[end])
+    rotation_quat = wp.normalize(wp.quat_from_matrix(rotation))
+    body_q[body] = wp.transform(center - wp.quat_rotate(rotation_quat, segment_com[e]), rotation_quat)
+    angular = cable_rotation_log(rotation * wp.transpose(frame_begin[e])) / dt
+    frame_velocity[e] = angular
+    body_qd[body] = wp.spatial_vector((center - previous_center) / dt, angular)

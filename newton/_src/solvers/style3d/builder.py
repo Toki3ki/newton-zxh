@@ -123,6 +123,43 @@ def add_stretch_constraints_kernel(
 
 
 @wp.kernel
+def add_scalar_stencils_kernel(
+    num_stencil: int,
+    stencil_size: int,
+    stencil_indices: wp.array2d[int],
+    stencil_weights: wp.array3d[float],
+    # outputs
+    neighbors: wp.array2d[int],
+    neighbor_counts: wp.array[int],
+    nz_values: wp.array2d[float],
+    diags: wp.array[float],
+    overflow: wp.array[int],
+):
+    """Accumulate user-supplied stencils whose 3x3 blocks are scalar multiples of ``I3``.
+
+    Stencil ``s`` couples the rows ``stencil_indices[s, i]`` and contributes the
+    symmetric block Hessian ``stencil_weights[s, i, j] * I3``.
+    """
+    for sid in range(num_stencil):
+        for i in range(stencil_size):
+            row = stencil_indices[sid, i]
+            for j in range(i, stencil_size):
+                weight = stencil_weights[sid, i, j]
+                if i == j:
+                    # Diagonal contribution
+                    diags[row] += weight
+                else:
+                    column = stencil_indices[sid, j]
+                    # Add off-diagonal symmetric entries
+                    slot_ij = add_connection(row, column, neighbor_counts, neighbors, overflow)
+                    slot_ji = add_connection(column, row, neighbor_counts, neighbors, overflow)
+                    if slot_ij >= 0:
+                        nz_values[row, slot_ij] += weight
+                    if slot_ji >= 0:
+                        nz_values[column, slot_ji] += weight
+
+
+@wp.kernel
 def assemble_nz_ell_kernel(
     neighbors: wp.array2d[int],
     nz_values: wp.array2d[float],
@@ -326,6 +363,47 @@ class PDMatrixBuilder:
         self.neighbors.assign(neighbors)
         self.values.assign(values)
         self.diags.assign(diags)
+
+    def add_scalar_stencils(self, indices: np.ndarray, weights: np.ndarray):
+        """Add block stencils whose Hessian blocks are scalar multiples of the identity.
+
+        Modules that own rows outside the cloth ranges assemble their constant
+        Projective Dynamics terms through this method. The caller supplies one
+        row-index stencil per constraint and the small dense Hessian of that
+        stencil, expressed as scalars that multiply ``I3``.
+
+        Args:
+            indices: Stencil row indices, shape ``[stencil_count, stencil_size]``.
+            weights: Stencil Hessians, shape ``[stencil_count, stencil_size,
+                stencil_size]``. Only the upper triangle is read, so pass a
+                symmetric matrix.
+
+        Raises:
+            ValueError: If the two arrays disagree on the stencil shape.
+        """
+        indices = np.ascontiguousarray(indices, dtype=np.int32)
+        weights = np.ascontiguousarray(weights, dtype=np.float32)
+        if indices.size == 0:
+            return
+        if indices.ndim != 2:
+            raise ValueError(f"add_scalar_stencils: indices must be 2D, got shape {indices.shape}.")
+        expected = (indices.shape[0], indices.shape[1], indices.shape[1])
+        if weights.shape != expected:
+            raise ValueError(f"add_scalar_stencils: weights must have shape {expected}, got {weights.shape}.")
+
+        wp.launch(
+            add_scalar_stencils_kernel,
+            dim=1,
+            inputs=[
+                indices.shape[0],
+                indices.shape[1],
+                wp.array2d(indices, dtype=int, device="cpu"),
+                wp.array3d(weights, dtype=float, device="cpu"),
+            ],
+            outputs=[self.neighbors, self.counts, self.values, self.diags, self._overflow],
+            device="cpu",
+        )
+        self._check_overflow()
 
     def finalize(self, device):
         """Assembles final sparse matrix in ELL format.

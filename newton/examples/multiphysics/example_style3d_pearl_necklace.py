@@ -126,7 +126,7 @@ def _bust_mesh():
 
 
 def _cord_path(side, layer, display):
-    """Resample each branch uniformly so particle contacts resolve every bore."""
+    """Resample each branch uniformly so cable segments resolve every bore."""
     t = np.linspace(0.0, 1.0, 2001)
     if display == "table":
         dense = np.column_stack(
@@ -360,8 +360,6 @@ class Example:
                 cable_twist_stiffness=1.0e-6,
             ),
         )
-        # Thin tube walls must not repel their opposite side at the cloth
-        # handler's default 6 mm thickness, which exceeds the whole diameter.
         self.state_0, self.state_1 = self.model.state(), self.model.state()
         self.control = self.model.control()
         self.pipeline = newton.CollisionPipeline(self.model, rigid_contact_max=20000, soft_contact_max=0)
