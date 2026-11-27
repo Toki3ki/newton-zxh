@@ -10,6 +10,132 @@ from .affine_body import affine_mass_multiply, inertia_to_second_moment
 
 
 @wp.kernel
+def eval_particle_body_attachment_kernel(
+    particle_count: int,
+    particles: wp.array[int],
+    bodies: wp.array[int],
+    points: wp.array[wp.vec3],
+    stiffness: wp.array[float],
+    damping: wp.array[float],
+    enabled: wp.array[wp.bool],
+    body_com: wp.array[wp.vec3],
+    x: wp.array[wp.vec3],
+    x_prev: wp.array[wp.vec3],
+    x_inertia: wp.array[wp.vec3],
+    flags: wp.array[int],
+    dt: float,
+    rhs: wp.array[wp.vec3],
+    diag: wp.array[wp.mat33],
+    tangents: wp.array[float],
+):
+    """Accumulate bilateral particle-body spring forces and implicit damping.
+
+    For particle position p and body affine coordinates q = (c, a0, a1, a2),
+    c is the world-space COM and A = [a0 a1 a2]. The authored attachment point
+    is body-origin-local, so r = points[i] - body_com[body] is COM-local.
+    With weights w = (1, r.x, r.y, r.z), the world-space attachment point is
+    y = sum_j w[j] q[j] = c + A r and the residual is e = p - y [m].
+
+    Let h = dt [s], k = stiffness[i] [N/m], d = damping[i] [N*s/m], and e_prev
+    be the same residual evaluated at the beginning of the substep (x_prev).
+    The elastic energy and backward-Euler incremental damping potential are::
+
+        E_elastic = (k / 2) * dot(e, e)
+        Phi = E_elastic + (d / (2*h)) * dot(e - e_prev, e - e_prev)
+        g = dPhi/de = k*e + (d/h)*(e - e_prev)
+
+    The damping potential is a time-discrete dissipation term, not stored
+    elastic energy. Its relative velocity is (e - e_prev) / h. For the block
+    coordinates z = (p, c, a0, a1, a2), with I the 3x3 identity::
+
+        J = de/dz = [I, -I, -r.x*I, -r.y*I, -r.z*I]
+        rhs += -J.T * g
+        H = d2Phi/dz2 = (k + d/h) * J.T * J
+
+    Thus the particle receives -g and the body blocks receive w[j]*g.
+    The COM force is +g; at a rigid configuration the torque is (A*r) cross g.
+    This kernel adds H_pp = (k+d/h)*I and H_qj,qj = (k+d/h)*w[j]^2*I to diag.
+    The companion matrix-product kernel adds all off-diagonal blocks. The
+    cached scalar tangent is k+d/h (zero for a disabled attachment).
+
+    Prescribed body coordinates use x_inertia instead of x to match contact
+    prediction. Their increments, and those of fixed particles, are held at
+    zero by solver flags; the above blocks are restricted to active DOFs by
+    the solve. Finite k permits a gap: this is not a hard positional constraint.
+    """
+    tid = wp.tid()
+    tangents[tid] = 0.0
+    if not enabled[tid]:
+        return
+    particle = particles[tid]
+    body = bodies[tid]
+    start = particle_count + 4 * body
+    local = points[tid] - body_com[body]
+    weights = wp.vec4(1.0, local[0], local[1], local[2])
+    residual = x[particle]
+    previous = x_prev[particle]
+    for j in range(4):
+        point = x[start + j]
+        # Match contact prediction for externally driven bodies.
+        if (flags[start] & ParticleFlags.ACTIVE) == 0:
+            point = x_inertia[start + j]
+        residual -= weights[j] * point
+        previous -= weights[j] * x_prev[start + j]
+    gradient = stiffness[tid] * residual + (damping[tid] / dt) * (residual - previous)
+    tangent = stiffness[tid] + damping[tid] / dt
+    tangents[tid] = tangent
+    identity = wp.identity(3, float)
+    wp.atomic_sub(rhs, particle, gradient)
+    wp.atomic_add(diag, particle, tangent * identity)
+    for j in range(4):
+        wp.atomic_add(rhs, start + j, weights[j] * gradient)
+        wp.atomic_add(diag, start + j, (tangent * weights[j] * weights[j]) * identity)
+
+
+@wp.kernel
+def particle_body_attachment_off_diag_multiply_kernel(
+    particle_count: int,
+    particles: wp.array[int],
+    bodies: wp.array[int],
+    points: wp.array[wp.vec3],
+    body_com: wp.array[wp.vec3],
+    tangents: wp.array[float],
+    x: wp.array[wp.vec3],
+    out: wp.array[wp.vec3],
+):
+    """Add the off-diagonal attachment Hessian product to out.
+
+    Using w = (1, r.x, r.y, r.z) and t = k + d/dt from the force kernel::
+
+        H_p, qj = H_qj, p = -t * w[j] * I
+        H_qj, ql = t * w[j] * w[l] * I(j != l)
+
+    For input vector x = (v_p, v_q0, ..., v_q3), set s = sum_j w[j]*v_qj::
+
+        out_p += -t * s
+        out_qj += t * w[j] * (s - w[j] * v_qj - v_p)
+
+    The diagonal blocks are already in the assembled matrix and are excluded
+    here. Unlike the force kernel, x is a matrix-product vector, not positions.
+    """
+    tid = wp.tid()
+    tangent = tangents[tid]
+    if tangent == 0.0:
+        return
+    particle = particles[tid]
+    body = bodies[tid]
+    start = particle_count + 4 * body
+    local = points[tid] - body_com[body]
+    weights = wp.vec4(1.0, local[0], local[1], local[2])
+    point = wp.vec3(0.0)
+    for j in range(4):
+        point += weights[j] * x[start + j]
+    wp.atomic_sub(out, particle, tangent * point)
+    for j in range(4):
+        wp.atomic_add(out, start + j, tangent * weights[j] * (point - weights[j] * x[start + j] - x[particle]))
+
+
+@wp.kernel
 def reset_tet_volume_targets_kernel(
     tet_indices: wp.array2d[wp.int32],
     particle_world: wp.array[wp.int32],
@@ -298,6 +424,8 @@ def eval_bend_kernel(
     edge_bending_cot: wp.array[wp.vec4],
     edges: wp.array2d[wp.int32],
     edge_bending_properties: wp.array2d[float],
+    rest_pos: wp.array[wp.vec3],
+    use_initial_curvature: bool,
     # outputs
     forces: wp.array[wp.vec3],
 ):
@@ -316,6 +444,16 @@ def eval_bend_kernel(
     from rest-pose cotangents. The conservative force is
 
         F_i = -dE_b/dx_i = -k * sum_j Q_ij x_j.
+
+    With initial curvature enabled, let c = sum_i w_i x_i and
+    r = ||sum_i w_i X_i|| for the initial positions X. Use
+
+        E_b = 1/2 * k * 3/(A0 + A1) * (||c|| - r)^2,
+        p = r * c/||c||,
+        F_i = -k * 3/(A0 + A1) * w_i * (c - p).
+
+    Holding the rotation-invariant local projection p fixed leaves the existing
+    positive semidefinite PD matrix unchanged. At c = 0 use the zero subgradient.
     """
     eid = wp.tid()
     if edges[eid][0] < 0 or edges[eid][1] < 0:
@@ -329,11 +467,18 @@ def eval_bend_kernel(
     bend_weight[3] = edge_bending_cot[eid][0] + edge_bending_cot[eid][1]
     bend_weight[0] = -edge_bending_cot[eid][0] - edge_bending_cot[eid][2]
     bend_weight[1] = -edge_bending_cot[eid][1] - edge_bending_cot[eid][3]
+    curvature = wp.vec3(0.0)
+    rest_curvature = wp.vec3(0.0)
+    # Relative coordinates avoid cancellation for small shells far from origin.
+    for j in range(3):
+        curvature += bend_weight[j] * (pos[edge[j]] - pos[edge[3]])
+        if use_initial_curvature:
+            rest_curvature += bend_weight[j] * (rest_pos[edge[j]] - rest_pos[edge[3]])
+    residual = curvature
+    if use_initial_curvature and wp.length(curvature) > 1.0e-12:
+        residual -= wp.length(rest_curvature) * wp.normalize(curvature)
     for i in range(4):
-        force = wp.vec3(0.0)
-        for j in range(4):
-            force = force - edge_stiff * bend_weight[i] * bend_weight[j] * pos[edge[j]]
-        wp.atomic_add(forces, edge[i], force)
+        wp.atomic_sub(forces, edge[i], edge_stiff * bend_weight[i] * residual)
 
 
 @wp.kernel
@@ -418,7 +563,13 @@ def init_step_kernel(
     dx: wp.array[wp.vec3],
     affine_mass_off_diag: wp.array[wp.vec3],
 ):
-    """Initialize particle and affine-body inertia data for one time step."""
+    """Initialize inertia and start active DOFs at their inertial prediction.
+
+    Carry ballistic motion in the nonlinear starting point so a truncated
+    solve of stiff elastic constraints does not have to recover it. Prescribed
+    DOFs retain their input configuration; contact and attachment kernels use
+    their separate inertia targets when evaluating moving boundaries.
+    """
     tid = wp.tid()
     if tid < particle_count:
         x_last = x_curr[tid]
@@ -435,7 +586,8 @@ def init_step_kernel(
             world_idx = particle_world[tid]
             world_g = gravity[world_idx]
             x_inertia[tid] = x_last + v_prev * dt + (world_g + f_ext[tid] / mass) * (dt * dt)
-            dx[tid] = v_prev * dt
+            x_curr[tid] = x_inertia[tid]
+            dx[tid] = wp.vec3(0.0)
     else:
         body = tid - particle_count
         start = particle_count + 4 * body
@@ -456,6 +608,8 @@ def init_step_kernel(
             dx[row] = wp.vec3(0.0)
             if body_mass[body] <= 0.0 and not is_kinematic:
                 x_inertia[row] = x_curr[row]
+            if active and not is_kinematic:
+                x_curr[row] = x_inertia[row]
             diagonal = mass
             if i > 0:
                 diagonal = moment[i - 1, i - 1]

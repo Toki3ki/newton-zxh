@@ -25,11 +25,13 @@ from .kernels import (
     compute_solver_flags_kernel,
     eval_bend_kernel,
     eval_drag_force_kernel,
+    eval_particle_body_attachment_kernel,
     eval_stretch_kernel,
     eval_tet_constraint_kernel,
     init_rhs_kernel,
     init_step_kernel,
     nonlinear_step_kernel,
+    particle_body_attachment_off_diag_multiply_kernel,
     prepare_jacobi_preconditioner_kernel,
     reset_tet_volume_targets_kernel,
     update_tet_plastic_rest_kernel,
@@ -96,6 +98,11 @@ class SolverStyle3D(SolverBase):
     mixes :attr:`Model.soft_contact_mu` with the shape coefficient geometrically.
     Only particle soft contacts are supported, not edge or triangle contacts.
     Deformable-only solves retain the one-way response to prescribed bodies.
+
+    Particle-body attachments authored with :meth:`ModelBuilder.add_attachment_particle_body`
+    are supported with :attr:`Dynamics.ALL`, finite nonnegative stiffness, and
+    implicit relative-velocity damping. Hard (infinite-stiffness) attachments
+    are not supported. Body-local points are measured from the body origin.
 
     References:
         1. Baraff, D. & Witkin, A. "Large Steps in Cloth Simulation."
@@ -221,6 +228,16 @@ class SolverStyle3D(SolverBase):
 
         enable_mouse_dragging: bool = False
         """Whether to enable the mouse-dragging kernel."""
+
+        use_initial_bend_curvature: bool = False
+        """Use the initial curvature magnitude as the cloth bending rest target.
+
+        Experimental: enables a rotation-invariant, projective curvature energy
+        for curved shells such as tubes. The default retains flat-rest quadratic
+        bending. This preserves curvature magnitude, not its sign, and does not
+        impose a rigid or exactly circular cross-section. This is a runtime
+        solver option; no additional authored USD attribute is required.
+        """
 
     config: Config
     """Live solver options, retained by reference when supplied at construction.
@@ -479,7 +496,9 @@ class SolverStyle3D(SolverBase):
                 a configuration is combined with legacy keyword options.
             AttributeError: If ``dynamics`` is :attr:`Dynamics.DEFORMABLE` and the
                 model is missing Style3D custom attributes.
-            ValueError: If ``dynamics`` contains unsupported flags.
+            ValueError: If ``dynamics`` contains unsupported flags, attachments
+                are used outside ``Dynamics.ALL`` or ``Dynamics.NONE``, or
+                attachment coefficients are not finite and nonnegative.
         """
 
         legacy_options = {
@@ -518,6 +537,20 @@ class SolverStyle3D(SolverBase):
 
         enable_deformable = bool(dynamics & SolverStyle3D.Dynamics.DEFORMABLE)
         enable_affine_body = bool(dynamics & SolverStyle3D.Dynamics.AFFINE_BODY)
+
+        self._attachment_count = model.attachment_particle_body_count if dynamics != self.Dynamics.NONE else 0
+        if self._attachment_count:
+            if dynamics != self.Dynamics.ALL:
+                raise ValueError("Style3D particle-body attachments require Dynamics.ALL.")
+            stiffness = model.attachment_particle_body_stiffness.numpy()
+            damping = model.attachment_particle_body_damping.numpy()
+            if not np.all(np.isfinite(stiffness)) or np.any(stiffness < 0.0):
+                raise ValueError(
+                    "Style3D attachments require finite nonnegative stiffness; hard attachments are unsupported."
+                )
+            if not np.all(np.isfinite(damping)) or np.any(damping < 0.0):
+                raise ValueError("Style3D attachments require finite nonnegative damping.")
+        self._attachment_tangents = wp.zeros(self._attachment_count, dtype=float, device=model.device)
 
         super().__init__(model)
         self._style3d_attr = getattr(model, "style3d", None)
@@ -771,6 +804,8 @@ class SolverStyle3D(SolverBase):
                         self._style3d_attr.edge_bending_cot,
                         self.model.edge_indices,
                         self.model.edge_bending_properties,
+                        self.model.particle_q,
+                        self.config.use_initial_bend_curvature,
                     ],
                     outputs=[self._rhs],
                     device=self.device,
@@ -842,6 +877,29 @@ class SolverStyle3D(SolverBase):
                     self._rhs,
                     self._A_diag,
                     dt,
+                )
+
+            if self._attachment_count:
+                wp.launch(
+                    eval_particle_body_attachment_kernel,
+                    dim=self._attachment_count,
+                    inputs=[
+                        self._particle_count,
+                        self.model.attachment_particle_body_particle,
+                        self.model.attachment_particle_body_body,
+                        self.model.attachment_particle_body_body_point,
+                        self.model.attachment_particle_body_stiffness,
+                        self.model.attachment_particle_body_damping,
+                        self.model.attachment_particle_body_enabled,
+                        self.model.body_com,
+                        self._x,
+                        self._x_prev,
+                        self._x_inertia,
+                        self._particle_flags,
+                        dt,
+                    ],
+                    outputs=[self._rhs, self._A_diag, self._attachment_tangents],
+                    device=self.device,
                 )
 
             wp.launch(
@@ -919,6 +977,22 @@ class SolverStyle3D(SolverBase):
             )
         if self._contact is not None:
             self._contact.off_diag_multiply(x, self._matrix_free_Ax)
+        if self._attachment_count:
+            wp.launch(
+                particle_body_attachment_off_diag_multiply_kernel,
+                dim=self._attachment_count,
+                inputs=[
+                    self._particle_count,
+                    self.model.attachment_particle_body_particle,
+                    self.model.attachment_particle_body_body,
+                    self.model.attachment_particle_body_body_point,
+                    self.model.body_com,
+                    self._attachment_tangents,
+                    x,
+                ],
+                outputs=[self._matrix_free_Ax],
+                device=self.device,
+            )
         return self._matrix_free_Ax
 
     def rebuild_bvh(self, state: State):

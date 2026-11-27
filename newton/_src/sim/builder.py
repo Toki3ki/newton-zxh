@@ -12335,7 +12335,8 @@ class ModelBuilder:
 
         The attachment pulls the particle toward a body-local anchor and
         transfers equal-and-opposite forces between both endpoints in
-        :class:`~newton.solvers.SolverVBD`. The constraint is translational;
+        :class:`~newton.solvers.SolverVBD` or, for finite stiffness, in
+        :class:`~newton.solvers.SolverStyle3D` with ``Dynamics.ALL``. The constraint is translational;
         a single particle does not define an orientation. Finite-stiffness
         attachments whose endpoints are owned by different solvers are
         coupled by
